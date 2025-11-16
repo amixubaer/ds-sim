@@ -6,17 +6,6 @@ import sys
 HOST = "localhost"
 PORT = 50000
 
-def recv_line(sock):
-    """Receive exactly one newline-terminated message"""
-    data = b""
-    while not data.endswith(b"\n"):
-        part = sock.recv(1)
-        if not part:
-            break
-        data += part
-    return data.decode().strip()
-
-
 def main():
     sock = None
     try:
@@ -25,45 +14,60 @@ def main():
         sock.connect((HOST, PORT))
         print(f"Connected to {HOST}:{PORT}")
 
-        # ---- PROTOCOL HANDSHAKE ----
+        # ---- EXACT PROTOCOL FROM PAGE 7 ----
 
-        # 1. HELO
+        # 1. Client sends HELO
         sock.sendall(b"HELO\n")
-        response = recv_line(sock)
-        print(f"HELO -> {response}")
+        response = sock.recv(1024).decode().strip()
+        print(f"1. HELO -> {response}")
         if response != "OK":
             print("HELO failed")
             return
 
-        # 2. AUTH (use MQ student ID or your actual username)
-        username = "48677922"
-        sock.sendall(f"AUTH {username}\n".encode())
-        response = recv_line(sock)
-        print(f"AUTH -> {response}")
+        # 2. Client sends AUTH
+        sock.sendall(b"AUTH user\n")
+        response = sock.recv(1024).decode().strip()
+        print(f"2. AUTH -> {response}")
         if response != "OK":
             print("AUTH failed")
             return
 
-        # 3. REDY (ask for first scheduling event)
+        # 3. Client sends REDY
         sock.sendall(b"REDY\n")
-        response = recv_line(sock)
-        print(f"REDY -> {response}")  # e.g., JOBN … or NONE
+        response = sock.recv(1024).decode().strip()
+        print(f"3. REDY -> {response}")
 
-        # 4. QUIT (We are stopping here; full solution will loop instead)
+        # Handle the response to REDY (could be JOBN, JCPL, RESF, RESR, CHKQ, NONE)
+        if response.startswith("JOBN"):
+            # This is a job that needs scheduling
+            print("Received a job - would schedule it here")
+            # For now, just acknowledge and continue
+            pass
+        elif response == "NONE":
+            print("No more jobs")
+        elif response.startswith("JCPL"):
+            print("Job completed")
+        elif response.startswith("RESF"):
+            print("Server failed")
+        elif response.startswith("RESR"):
+            print("Server recovered")
+        elif response == "CHKQ":
+            print("Check queue")
+
+        # 4. Client sends QUIT (after handling NONE or when done)
         sock.sendall(b"QUIT\n")
-        response = recv_line(sock)
-        print(f"QUIT -> {response}")
+        response = sock.recv(1024).decode().strip()
+        print(f"4. QUIT -> {response}")
+
+        print("Protocol completed successfully!")
 
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
-
+        import traceback
+        traceback.print_exc()
     finally:
         if sock:
-            try:
-                sock.close()
-            except:
-                pass
-
+            sock.close()
 
 if __name__ == "__main__":
     main()
