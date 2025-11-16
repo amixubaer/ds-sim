@@ -21,7 +21,7 @@ def main():
     parser.add_argument(
         "--algo",
         required=True,
-        help="Scheduling algorithm name (this is used in AUTH and for ds_test)",
+        help="Scheduling algorithm name (used in AUTH and by ds_test)",
     )
     parser.add_argument(
         "--port",
@@ -38,13 +38,11 @@ def main():
     sock.connect(("localhost", args.port))
 
     # ===== Handshake =====
-    # 1) HELO
     sock.sendall(b"HELO\n")
     resp1 = recv_line(sock)
     print(f"HELO: {resp1}", file=sys.stderr)
 
-    # 2) AUTH <algo-name>
-    # ds_test.py passes --algo <name> and expects this to appear in AUTH
+    # ds_test.py expects AUTH <algo>
     sock.sendall(f"AUTH {args.algo}\n".encode())
     resp2 = recv_line(sock)
     print(f"AUTH: {resp2}", file=sys.stderr)
@@ -56,7 +54,7 @@ def main():
 
     print("Handshake SUCCESSFUL", file=sys.stderr)
 
-    # ===== GETS All: obtain static server list =====
+    # ===== GETS All: get static server list =====
     sock.sendall(b"GETS All\n")
     data_resp = recv_line(sock)
     print(f"GETS All: {data_resp}", file=sys.stderr)
@@ -66,15 +64,17 @@ def main():
         parts = data_resp.split()
         n_recs = int(parts[1])
 
-        # Acknowledge DATA, then receive n_recs lines and a terminating '.'
+        # Acknowledge DATA
         sock.sendall(b"OK\n")
 
+        # Receive n_recs server records
         for _ in range(n_recs):
             line = recv_line(sock)
             servers.append(line)
             print(f"Server: {line}", file=sys.stderr)
 
-        # After n_recs lines, server sends '.'
+        # After records, we must send OK, then server replies with '.'
+        sock.sendall(b"OK\n")
         dot = recv_line(sock)
         print(f"End of GETS All marker: {dot}", file=sys.stderr)
 
@@ -96,25 +96,32 @@ def main():
             print("No more jobs - simulation complete", file=sys.stderr)
             break
 
-        # Ignore completion and other non-job events for this simple scheduler
-        if event.startswith("JCPL") or event.startswith("RESF") or event.startswith("RESR") or event.startswith("CHKQ"):
+        # Ignore completion and other non-job events
+        if (
+            event.startswith("JCPL")
+            or event.startswith("RESF")
+            or event.startswith("RESR")
+            or event.startswith("CHKQ")
+        ):
             print(f"Ignoring event: {event}", file=sys.stderr)
             continue
 
         # New or pre-empted job
         if event.startswith("JOBN") or event.startswith("JOBP"):
             parts = event.split()
-            # JOBN submitTime jobID estRunTime cores memory disk
-            # or JOBP submitTime jobID estRunTime cores memory disk
-            # Format in COMP8110 configs is typically: JOBN 0 22 10 14000 29300 379
+            # Spec: JOBN jobID submitTime core memory disk estRuntime
+            # e.g., JOBN 0 22 10 14000 29300 379
             if len(parts) >= 7:
-                job_id = parts[2]
-                cores = int(parts[4])
-                memory = int(parts[5])
-                disk = int(parts[6])
+                job_id = parts[1]
+                submit_time = int(parts[2])   # not used, but correct for clarity
+                cores = int(parts[3])
+                memory = int(parts[4])
+                disk = int(parts[5])
+                est_runtime = int(parts[6])   # not used, but parsed
 
                 print(
-                    f"Job {job_id} needs: {cores} cores, {memory}MB, {disk}MB",
+                    f"Job {job_id} needs: {cores} cores, "
+                    f"{memory}MB, {disk}MB",
                     file=sys.stderr,
                 )
 
@@ -122,7 +129,7 @@ def main():
                 scheduled = False
                 for server in servers:
                     s_parts = server.split()
-                    # Typical format: type id state curStart cores memory disk ...
+                    # Format: type id state curStartTime cores memory disk ...
                     s_type = s_parts[0]
                     s_id = s_parts[1]
                     s_cores = int(s_parts[4])
