@@ -10,7 +10,6 @@ class DSClient:
         self.socket = None
         
     def connect(self):
-        """Establish connection to ds-server"""
         try:
             self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.socket.connect((self.host, self.port))
@@ -20,7 +19,6 @@ class DSClient:
             return False
     
     def send_command(self, command):
-        """Send command to server and return response"""
         try:
             self.socket.send(f"{command}\n".encode())
             response = self.socket.recv(4096).decode().strip()
@@ -30,13 +28,10 @@ class DSClient:
             return None
     
     def handshake(self):
-        """Perform the initial handshake with ds-server"""
-        # Step 1: Send HELO
         response = self.send_command("HELO")
         if response != "OK":
             return False
         
-        # Step 2: Send AUTH
         response = self.send_command("AUTH client")
         if response != "OK":
             return False
@@ -51,7 +46,6 @@ def main():
     
     if client.handshake():
         print("Handshake successful")
-        # Send QUIT to end gracefully
         client.send_command("QUIT")
         sys.exit(0)
     else:
@@ -60,3 +54,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+EOF
