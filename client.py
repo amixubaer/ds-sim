@@ -4,34 +4,40 @@ import socket
 import sys
 
 def main():
+    sock = None
     try:
-        # Create socket and connect
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.connect(('localhost', 50000))
         
-        # Step 1: Send HELO
+        # Read initial message from server
+        init_msg = sock.recv(1024).decode()
+        print(f"Server init: {init_msg.strip()}")
+        
+        # Send HELO
         sock.send(b"HELO\n")
-        response1 = sock.recv(1024).decode().strip()
+        response = sock.recv(1024).decode().strip()
+        print(f"HELO -> {response}")
         
-        # Step 2: Send AUTH
+        # Send AUTH
         sock.send(b"AUTH client\n")
-        response2 = sock.recv(1024).decode().strip()
+        response = sock.recv(1024).decode().strip()
+        print(f"AUTH -> {response}")
         
-        # Check if both responses are OK
-        if response1 == "OK" and response2 == "OK":
-            print("Handshake successful")
-            # Send QUIT to end
-            sock.send(b"QUIT\n")
-            sock.close()
-            sys.exit(0)
-        else:
-            print("Handshake failed")
-            sock.close()
-            sys.exit(1)
-            
+        # Send REDY
+        sock.send(b"REDY\n")
+        response = sock.recv(1024).decode().strip()
+        print(f"REDY -> {response}")
+        
+        # Send QUIT
+        sock.send(b"QUIT\n")
+        response = sock.recv(1024).decode().strip()
+        print(f"QUIT -> {response}")
+        
     except Exception as e:
         print(f"Error: {e}")
-        sys.exit(1)
+    finally:
+        if sock:
+            sock.close()
 
 if __name__ == "__main__":
     main()
