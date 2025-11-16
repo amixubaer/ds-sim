@@ -3,55 +3,35 @@
 import socket
 import sys
 
-class DSClient:
-    def __init__(self, host='localhost', port=50000):
-        self.host = host
-        self.port = port
-        self.socket = None
-        
-    def connect(self):
-        try:
-            self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.socket.connect((self.host, self.port))
-            return True
-        except Exception as e:
-            print(f"Connection failed: {e}", file=sys.stderr)
-            return False
-    
-    def send_command(self, command):
-        try:
-            self.socket.send(f"{command}\n".encode())
-            response = self.socket.recv(4096).decode().strip()
-            return response
-        except Exception as e:
-            print(f"Error: {e}", file=sys.stderr)
-            return None
-    
-    def handshake(self):
-        response = self.send_command("HELO")
-        if response != "OK":
-            return False
-        
-        response = self.send_command("AUTH client")
-        if response != "OK":
-            return False
-        
-        return True
-
 def main():
-    client = DSClient()
-    
-    if not client.connect():
-        sys.exit(1)
-    
-    if client.handshake():
-        print("Handshake successful")
-        client.send_command("QUIT")
-        sys.exit(0)
-    else:
-        print("Handshake failed")
+    try:
+        # Create socket and connect
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.connect(('localhost', 50000))
+        
+        # Step 1: Send HELO
+        sock.send(b"HELO\n")
+        response1 = sock.recv(1024).decode().strip()
+        
+        # Step 2: Send AUTH
+        sock.send(b"AUTH client\n")
+        response2 = sock.recv(1024).decode().strip()
+        
+        # Check if both responses are OK
+        if response1 == "OK" and response2 == "OK":
+            print("Handshake successful")
+            # Send QUIT to end
+            sock.send(b"QUIT\n")
+            sock.close()
+            sys.exit(0)
+        else:
+            print("Handshake failed")
+            sock.close()
+            sys.exit(1)
+            
+    except Exception as e:
+        print(f"Error: {e}")
         sys.exit(1)
 
 if __name__ == "__main__":
     main()
-EOF
