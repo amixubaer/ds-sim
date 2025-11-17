@@ -59,8 +59,6 @@ def main():
     data_resp = recv_line(sock)
     print(f"GETS All: {data_resp}", file=sys.stderr)
 
-    # We'll store parsed server records as tuples:
-    # (type, id, cores, memory, disk)
     servers = []
     if data_resp.startswith("DATA"):
         parts = data_resp.split()
@@ -72,27 +70,18 @@ def main():
         # Receive n_recs server records
         for _ in range(n_recs):
             line = recv_line(sock)
+            servers.append(line)
             print(f"Server: {line}", file=sys.stderr)
-            s_parts = line.split()
-            # Format: type id state curStartTime cores memory disk ...
-            s_type = s_parts[0]
-            s_id = s_parts[1]
-            s_cores = int(s_parts[4])
-            s_memory = int(s_parts[5])
-            s_disk = int(s_parts[6])
-            servers.append((s_type, s_id, s_cores, s_memory, s_disk))
 
         # After records, we must send OK, then server replies with '.'
         sock.sendall(b"OK\n")
         dot = recv_line(sock)
         print(f"End of GETS All marker: {dot}", file=sys.stderr)
 
-    num_servers = len(servers)
-    print(f"Found {num_servers} servers", file=sys.stderr)
+    print(f"Found {len(servers)} servers", file=sys.stderr)
 
-    # ===== Main scheduling loop: round-robin over capable servers =====
+    # ===== Main scheduling loop (simple FC-style: first capable server) =====
     scheduled_jobs = 0
-    rr_index = 0  # round-robin index
 
     while True:
         # Ask for next event
@@ -120,16 +109,14 @@ def main():
         # New or pre-empted job
         if event.startswith("JOBN") or event.startswith("JOBP"):
             parts = event.split()
-            # According to ds-sim spec (for the given configs):
             # JOBN jobID submitTime core memory disk estRuntime
-            # e.g., JOBN 0 22 10 14000 29300 379
             if len(parts) >= 7:
                 job_id = parts[1]
-                submit_time = int(parts[2])   # not used, but kept for clarity
+                submit_time = int(parts[2])   # unused but correct
                 cores = int(parts[3])
                 memory = int(parts[4])
                 disk = int(parts[5])
-                est_runtime = int(parts[6])   # not used, but parsed
+                est_runtime = int(parts[6])   # unused but parsed
 
                 print(
                     f"Job {job_id} needs: {cores} cores, "
@@ -137,33 +124,33 @@ def main():
                     file=sys.stderr,
                 )
 
-                # Round-robin: try up to num_servers, starting from rr_index
+                # FC-style: choose first capable server from 'servers' list
                 scheduled = False
-                if num_servers == 0:
-                    print("No servers available!", file=sys.stderr)
-                else:
-                    for attempt in range(num_servers):
-                        idx = (rr_index + attempt) % num_servers
-                        s_type, s_id, s_cores, s_memory, s_disk = servers[idx]
+                for server in servers:
+                    s_parts = server.split()
+                    # Format: type id state curStartTime cores memory disk ...
+                    s_type = s_parts[0]
+                    s_id = s_parts[1]
+                    s_cores = int(s_parts[4])
+                    s_memory = int(s_parts[5])
+                    s_disk = int(s_parts[6])
 
-                        if (
-                            s_cores >= cores
-                            and s_memory >= memory
-                            and s_disk >= disk
-                        ):
-                            schedule_cmd = f"SCHD {job_id} {s_type} {s_id}\n"
-                            sock.sendall(schedule_cmd.encode())
-                            resp = recv_line(sock)
-                            print(
-                                f"SCHD {job_id} to {s_type} {s_id}: {resp}",
-                                file=sys.stderr,
-                            )
+                    if (
+                        s_cores >= cores
+                        and s_memory >= memory
+                        and s_disk >= disk
+                    ):
+                        schedule_cmd = f"SCHD {job_id} {s_type} {s_id}\n"
+                        sock.sendall(schedule_cmd.encode())
+                        resp = recv_line(sock)
+                        print(
+                            f"SCHD {job_id} to {s_type} {s_id}: {resp}",
+                            file=sys.stderr,
+                        )
 
-                            if resp == "OK":
-                                scheduled_jobs += 1
-                                scheduled = True
-                                # Next job starts from the server after this one
-                                rr_index = (idx + 1) % num_servers
+                        if resp == "OK":
+                            scheduled_jobs += 1
+                            scheduled = True
                             break
 
                 if not scheduled:
@@ -171,19 +158,18 @@ def main():
                         f"WARNING: Could not find capable server for job {job_id}",
                         file=sys.stderr,
                     )
-                    # Fallback – schedule to first server anyway (may cause ERR)
-                    if num_servers > 0:
-                        s_type, s_id, _, _, _ = servers[0]
-                        fallback_cmd = f"SCHD {job_id} {s_type} {s_id}\n"
+                    # Fallback – schedule to first server anyway
+                    if servers:
+                        first = servers[0].split()
+                        fallback_cmd = f"SCHD {job_id} {first[0]} {first[1]}\n"
                         sock.sendall(fallback_cmd.encode())
                         resp = recv_line(sock)
                         print(
-                            f"Fallback SCHD {job_id} to {s_type} {s_id}: {resp}",
+                            f"Fallback SCHD {job_id} to {first[0]} {first[1]}: {resp}",
                             file=sys.stderr,
                         )
 
         else:
-            # Unknown event type, just log and continue
             print(f"Unknown event: {event}", file=sys.stderr)
 
     # ===== Clean shutdown =====
