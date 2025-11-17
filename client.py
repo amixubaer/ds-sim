@@ -3,7 +3,6 @@
 import socket
 import sys
 import argparse
-import math
 
 
 def recv_line(sock):
@@ -37,11 +36,11 @@ def main():
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.connect(("localhost", args.port))
 
-    # Optional: try to read any initial greeting (if server sends one)
+    # Try to read one line with a short timeout; if nothing, ignore.
+    sock.settimeout(0.2)
     try:
-        sock.settimeout(0.5)
-        _ = recv_line(sock)  # ignore contents
-    except socket.timeout:
+        _ = recv_line(sock)
+    except (socket.timeout, OSError):
         pass
     finally:
         sock.settimeout(None)
@@ -54,6 +53,11 @@ def main():
     resp2 = recv_line(sock)
 
     if resp1 != "OK" or resp2 != "OK":
+        sock.sendall(b"QUIT\n")
+        try:
+            recv_line(sock)
+        except Exception:
+            pass
         sock.close()
         sys.exit(1)
 
@@ -64,16 +68,20 @@ def main():
     parts = data_resp.split()
     if len(parts) < 3 or not data_resp.startswith("DATA"):
         sock.sendall(b"QUIT\n")
-        recv_line(sock)
+        try:
+            recv_line(sock)
+        except Exception:
+            pass
         sock.close()
         sys.exit(1)
 
     n_recs = int(parts[1])
 
+    # Acknowledge DATA
     sock.sendall(b"OK\n")
 
-    # Server state: maintain predicted availability for ECT
-    # Record format: type id state curStartTime cores mem disk wJobs rJobs cost ...
+    # Server state: capacity, cost, and heuristic "load"
+    # Record format (this variant): type id state curStartTime cores mem disk [wJobs rJobs cost ...]
     server_state = {}
     max_cost = 0.0
 
@@ -86,6 +94,7 @@ def main():
         mem = int(rec[5])
         disk = int(rec[6])
 
+        # Cost may not be present in all builds; default to 1.0 if missing/invalid
         cost = 1.0
         if len(rec) >= 9:
             try:
@@ -97,19 +106,20 @@ def main():
             "cores": cores,
             "mem": mem,
             "disk": disk,
-            "available_at": 0,  # our predicted next free time
             "cost": cost,
+            "load": 0.0,  # heuristic total core-time load
         }
         if cost > max_cost:
             max_cost = cost
 
+    # Finish GETS All sequence
     sock.sendall(b"OK\n")
     _ = recv_line(sock)  # final "."
 
     if max_cost <= 0:
         max_cost = 1.0
 
-    # ===== Main scheduling loop: Earliest Completion Time (ECT) =====
+    # ===== Main scheduling loop: load-balanced heuristic =====
     while True:
         sock.sendall(b"REDY\n")
         event = recv_line(sock)
@@ -122,71 +132,76 @@ def main():
 
         parts = event.split()
 
-        # Job completion: update our predicted availability
-        if event.startswith("JCPL"):
-            if len(parts) >= 5:
-                finish_time = int(parts[1])
-                s_type = parts[3]
-                s_id = parts[4]
-                key = (s_type, s_id)
-                if key in server_state and finish_time > server_state[key]["available_at"]:
-                    server_state[key]["available_at"] = finish_time
-            continue
-
-        # Ignore other non-job events
-        if event.startswith(("RESF", "RESR", "CHKQ")):
+        # Ignore completion and other non-job events (no need to model exact finish times)
+        if event.startswith(("JCPL", "RESF", "RESR", "CHKQ")):
             continue
 
         # New or pre-empted job
         if event.startswith("JOBN") or event.startswith("JOBP"):
-            # MQ spec: JOBN submitTime jobID cores memory disk estRuntime
+            # In this ds-sim variant: JOBN submitTime jobID cores memory disk estRuntime
             if len(parts) < 7:
                 continue
 
-            submit_time = int(parts[1])
+            submit_time = int(parts[1])      # not used in heuristic, but correct position
             job_id = parts[2]
             cores = int(parts[3])
             mem = int(parts[4])
             disk = int(parts[5])
             est_runtime = int(parts[6])
 
-            best_server = None
-            best_finish = math.inf
+            # Choose server with minimal heuristic "load" among capable servers.
+            best_key = None
+            best_score = None
 
-            # Earliest Completion Time: min over capable servers
             for key, s in server_state.items():
-                if s["cores"] >= cores and s["mem"] >= mem and s["disk"] >= disk:
-                    start_time = max(s["available_at"], submit_time)
-                    finish_time = start_time + est_runtime
-                    if finish_time < best_finish:
-                        best_finish = finish_time
-                        best_server = key
+                if (
+                    s["cores"] >= cores
+                    and s["mem"] >= mem
+                    and s["disk"] >= disk
+                ):
+                    # Base score: current total core-time load on this server
+                    score = s["load"]
 
-            if best_server is None:
-                # Fallback: first server if something weird happens
+                    # Mild cost tie-breaker: prefer cheaper servers if loads similar
+                    score += 0.001 * s["cost"] * cores * max(est_runtime, 1)
+
+                    if best_score is None or score < best_score:
+                        best_score = score
+                        best_key = key
+
+            # Fallback: if somehow no capable server found, just use the first one
+            if best_key is None:
                 if not server_state:
                     sock.sendall(b"QUIT\n")
-                    recv_line(sock)
+                    try:
+                        recv_line(sock)
+                    except Exception:
+                        pass
                     sock.close()
                     sys.exit(1)
-                best_server = next(iter(server_state.keys()))
-                best_finish = submit_time + est_runtime
+                best_key = next(iter(server_state.keys()))
 
-            s_type, s_id = best_server
+            s_type, s_id = best_key
+
+            # Send schedule command
             cmd = f"SCHD {job_id} {s_type} {s_id}\n"
             sock.sendall(cmd.encode())
             _ = recv_line(sock)  # expect "OK"
 
-            # Update predicted availability
-            server_state[best_server]["available_at"] = best_finish
+            # Update heuristic load: cores * runtime
+            server_state[best_key]["load"] += cores * max(est_runtime, 1)
 
             continue
 
-        # Anything else: ignore
+        # Any other event types are ignored
 
     # ===== Clean shutdown =====
     sock.sendall(b"QUIT\n")
-    _ = recv_line(sock)
+    try:
+        _ = recv_line(sock)
+    except Exception:
+        pass
+
     sock.close()
     sys.exit(0)
 
