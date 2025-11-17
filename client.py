@@ -3,6 +3,7 @@
 import socket
 import sys
 import argparse
+import math
 
 
 def recv_line(sock):
@@ -21,164 +22,173 @@ def main():
     parser.add_argument(
         "--algo",
         required=True,
-        help="Scheduling algorithm name (used in AUTH and by ds_test)",
+        help="Scheduling algorithm name (sent in AUTH).",
     )
     parser.add_argument(
+        "-p",
         "--port",
         type=int,
         default=50000,
-        help="Port ds-server is listening on (default 50000)",
+        help="Port ds-server is listening on (default 50000).",
     )
     args = parser.parse_args()
-
-    print(f"Starting client with algo={args.algo}", file=sys.stderr)
 
     # ===== Connect to server =====
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.connect(("localhost", args.port))
 
+    # Optional: try to read any initial greeting (if server sends one)
+    try:
+        sock.settimeout(0.5)
+        _ = recv_line(sock)  # ignore contents
+    except socket.timeout:
+        pass
+    finally:
+        sock.settimeout(None)
+
     # ===== Handshake =====
     sock.sendall(b"HELO\n")
     resp1 = recv_line(sock)
-    print(f"HELO: {resp1}", file=sys.stderr)
 
-    # ds_test.py expects AUTH <algo>
     sock.sendall(f"AUTH {args.algo}\n".encode())
     resp2 = recv_line(sock)
-    print(f"AUTH: {resp2}", file=sys.stderr)
 
     if resp1 != "OK" or resp2 != "OK":
-        print("Handshake FAILED", file=sys.stderr)
         sock.close()
         sys.exit(1)
-
-    print("Handshake SUCCESSFUL", file=sys.stderr)
 
     # ===== GETS All: get static server list =====
     sock.sendall(b"GETS All\n")
     data_resp = recv_line(sock)
-    print(f"GETS All: {data_resp}", file=sys.stderr)
 
-    servers = []
-    if data_resp.startswith("DATA"):
-        parts = data_resp.split()
-        n_recs = int(parts[1])
+    parts = data_resp.split()
+    if len(parts) < 3 or not data_resp.startswith("DATA"):
+        sock.sendall(b"QUIT\n")
+        recv_line(sock)
+        sock.close()
+        sys.exit(1)
 
-        # Acknowledge DATA
-        sock.sendall(b"OK\n")
+    n_recs = int(parts[1])
 
-        # Receive n_recs server records
-        for _ in range(n_recs):
-            line = recv_line(sock)
-            servers.append(line)
-            print(f"Server: {line}", file=sys.stderr)
+    sock.sendall(b"OK\n")
 
-        # After records, we must send OK, then server replies with '.'
-        sock.sendall(b"OK\n")
-        dot = recv_line(sock)
-        print(f"End of GETS All marker: {dot}", file=sys.stderr)
+    # Server state: maintain predicted availability for ECT
+    # Record format: type id state curStartTime cores mem disk wJobs rJobs cost ...
+    server_state = {}
+    max_cost = 0.0
 
-    print(f"Found {len(servers)} servers", file=sys.stderr)
+    for _ in range(n_recs):
+        line = recv_line(sock)
+        rec = line.split()
+        s_type = rec[0]
+        s_id = rec[1]
+        cores = int(rec[4])
+        mem = int(rec[5])
+        disk = int(rec[6])
 
-    # ===== Main scheduling loop (simple FC-style: first capable server) =====
-    scheduled_jobs = 0
+        cost = 1.0
+        if len(rec) >= 9:
+            try:
+                cost = float(rec[8])
+            except ValueError:
+                cost = 1.0
 
+        server_state[(s_type, s_id)] = {
+            "cores": cores,
+            "mem": mem,
+            "disk": disk,
+            "available_at": 0,  # our predicted next free time
+            "cost": cost,
+        }
+        if cost > max_cost:
+            max_cost = cost
+
+    sock.sendall(b"OK\n")
+    _ = recv_line(sock)  # final "."
+
+    if max_cost <= 0:
+        max_cost = 1.0
+
+    # ===== Main scheduling loop: Earliest Completion Time (ECT) =====
     while True:
-        # Ask for next event
         sock.sendall(b"REDY\n")
         event = recv_line(sock)
 
         if not event:
-            print("Empty event, terminating.", file=sys.stderr)
             break
 
         if event == "NONE":
-            print("No more jobs - simulation complete", file=sys.stderr)
             break
 
-        # Ignore completion and other non-job events
-        if (
-            event.startswith("JCPL")
-            or event.startswith("RESF")
-            or event.startswith("RESR")
-            or event.startswith("CHKQ")
-        ):
-            print(f"Ignoring event: {event}", file=sys.stderr)
+        parts = event.split()
+
+        # Job completion: update our predicted availability
+        if event.startswith("JCPL"):
+            if len(parts) >= 5:
+                finish_time = int(parts[1])
+                s_type = parts[3]
+                s_id = parts[4]
+                key = (s_type, s_id)
+                if key in server_state and finish_time > server_state[key]["available_at"]:
+                    server_state[key]["available_at"] = finish_time
+            continue
+
+        # Ignore other non-job events
+        if event.startswith(("RESF", "RESR", "CHKQ")):
             continue
 
         # New or pre-empted job
         if event.startswith("JOBN") or event.startswith("JOBP"):
-            parts = event.split()
-            # JOBN jobID submitTime core memory disk estRuntime
-            if len(parts) >= 7:
-                job_id = parts[1]
-                submit_time = int(parts[2])   # unused but correct
-                cores = int(parts[3])
-                memory = int(parts[4])
-                disk = int(parts[5])
-                est_runtime = int(parts[6])   # unused but parsed
+            # MQ spec: JOBN submitTime jobID cores memory disk estRuntime
+            if len(parts) < 7:
+                continue
 
-                print(
-                    f"Job {job_id} needs: {cores} cores, "
-                    f"{memory}MB, {disk}MB",
-                    file=sys.stderr,
-                )
+            submit_time = int(parts[1])
+            job_id = parts[2]
+            cores = int(parts[3])
+            mem = int(parts[4])
+            disk = int(parts[5])
+            est_runtime = int(parts[6])
 
-                # FC-style: choose first capable server from 'servers' list
-                scheduled = False
-                for server in servers:
-                    s_parts = server.split()
-                    # Format: type id state curStartTime cores memory disk ...
-                    s_type = s_parts[0]
-                    s_id = s_parts[1]
-                    s_cores = int(s_parts[4])
-                    s_memory = int(s_parts[5])
-                    s_disk = int(s_parts[6])
+            best_server = None
+            best_finish = math.inf
 
-                    if (
-                        s_cores >= cores
-                        and s_memory >= memory
-                        and s_disk >= disk
-                    ):
-                        schedule_cmd = f"SCHD {job_id} {s_type} {s_id}\n"
-                        sock.sendall(schedule_cmd.encode())
-                        resp = recv_line(sock)
-                        print(
-                            f"SCHD {job_id} to {s_type} {s_id}: {resp}",
-                            file=sys.stderr,
-                        )
+            # Earliest Completion Time: min over capable servers
+            for key, s in server_state.items():
+                if s["cores"] >= cores and s["mem"] >= mem and s["disk"] >= disk:
+                    start_time = max(s["available_at"], submit_time)
+                    finish_time = start_time + est_runtime
+                    if finish_time < best_finish:
+                        best_finish = finish_time
+                        best_server = key
 
-                        if resp == "OK":
-                            scheduled_jobs += 1
-                            scheduled = True
-                            break
+            if best_server is None:
+                # Fallback: first server if something weird happens
+                if not server_state:
+                    sock.sendall(b"QUIT\n")
+                    recv_line(sock)
+                    sock.close()
+                    sys.exit(1)
+                best_server = next(iter(server_state.keys()))
+                best_finish = submit_time + est_runtime
 
-                if not scheduled:
-                    print(
-                        f"WARNING: Could not find capable server for job {job_id}",
-                        file=sys.stderr,
-                    )
-                    # Fallback – schedule to first server anyway
-                    if servers:
-                        first = servers[0].split()
-                        fallback_cmd = f"SCHD {job_id} {first[0]} {first[1]}\n"
-                        sock.sendall(fallback_cmd.encode())
-                        resp = recv_line(sock)
-                        print(
-                            f"Fallback SCHD {job_id} to {first[0]} {first[1]}: {resp}",
-                            file=sys.stderr,
-                        )
+            s_type, s_id = best_server
+            cmd = f"SCHD {job_id} {s_type} {s_id}\n"
+            sock.sendall(cmd.encode())
+            _ = recv_line(sock)  # expect "OK"
 
-        else:
-            print(f"Unknown event: {event}", file=sys.stderr)
+            # Update predicted availability
+            server_state[best_server]["available_at"] = best_finish
+
+            continue
+
+        # Anything else: ignore
 
     # ===== Clean shutdown =====
     sock.sendall(b"QUIT\n")
-    quit_resp = recv_line(sock)
-    print(f"QUIT: {quit_resp}", file=sys.stderr)
-
+    _ = recv_line(sock)
     sock.close()
-    print(f"Successfully scheduled {scheduled_jobs} jobs", file=sys.stderr)
+    sys.exit(0)
 
 
 if __name__ == "__main__":
