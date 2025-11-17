@@ -36,6 +36,7 @@ def main():
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.connect(("localhost", args.port))
 
+    # Some ds-server builds send an initial line; others (with -n) do not.
     # Try to read one line with a short timeout; if nothing, ignore.
     sock.settimeout(0.2)
     try:
@@ -61,6 +62,8 @@ def main():
         sock.close()
         sys.exit(1)
 
+        print(">>> HANDSHAKE SUCCESSFUL <<<", file=sys.stderr)  
+
     # ===== GETS All: get static server list =====
     sock.sendall(b"GETS All\n")
     data_resp = recv_line(sock)
@@ -81,6 +84,7 @@ def main():
     sock.sendall(b"OK\n")
 
     # Server state: capacity, cost, and heuristic "load"
+    # Record format (this variant): type id state curStartTime cores mem disk [wJobs rJobs cost ...]
     server_state = {}
     max_cost = 0.0
 
@@ -131,17 +135,17 @@ def main():
 
         parts = event.split()
 
-        # Ignore completion and other non-job events
+        # Ignore completion and other non-job events (no need to model exact finish times)
         if event.startswith(("JCPL", "RESF", "RESR", "CHKQ")):
             continue
 
         # New or pre-empted job
         if event.startswith("JOBN") or event.startswith("JOBP"):
-            # Format: JOBN submitTime jobID cores memory disk estRuntime
+            # In this ds-sim variant: JOBN submitTime jobID cores memory disk estRuntime
             if len(parts) < 7:
                 continue
 
-            submit_time = int(parts[1])  # not used in heuristic, but correct position
+            submit_time = int(parts[1])      # not used in heuristic, but correct position
             job_id = parts[2]
             cores = int(parts[3])
             mem = int(parts[4])
@@ -158,16 +162,18 @@ def main():
                     and s["mem"] >= mem
                     and s["disk"] >= disk
                 ):
-                    # Base score = load
+                    # Base score: current total core-time load on this server
                     score = s["load"]
-                    # Small cost tie-breaker
+
+                    # Mild cost tie-breaker: prefer cheaper servers if loads similar
+                    # (no need to over-penalise cost; turnaround is main objective)
                     score += 0.001 * s["cost"] * cores * max(est_runtime, 1)
 
                     if best_score is None or score < best_score:
                         best_score = score
                         best_key = key
 
-            # Fallback: if no capable server
+            # Fallback: if somehow no capable server found, just use the first one
             if best_key is None:
                 if not server_state:
                     sock.sendall(b"QUIT\n")
@@ -186,12 +192,12 @@ def main():
             sock.sendall(cmd.encode())
             _ = recv_line(sock)  # expect "OK"
 
-            # Update heuristic load
+            # Update heuristic load: cores * runtime
             server_state[best_key]["load"] += cores * max(est_runtime, 1)
 
             continue
 
-        # All other event types ignored
+        # Any other event types are ignored
 
     # ===== Clean shutdown =====
     sock.sendall(b"QUIT\n")
