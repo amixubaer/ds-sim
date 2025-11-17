@@ -16,12 +16,94 @@ def recv_line(sock):
     return data.decode().strip()
 
 
+def gets_servers(sock, query):
+    """
+    Send a GETS query (Avail or Capable) and return a list of server records.
+    Each record is a dict with keys: type, id, state, cur_start, cores, mem, disk, cost.
+    """
+    sock.sendall(query.encode())
+    header = recv_line(sock)
+
+    if not header.startswith("DATA"):
+        # No data or protocol issue: return empty list
+        return []
+
+    parts = header.split()
+    n_recs = int(parts[1])
+
+    # Acknowledge DATA header
+    sock.sendall(b"OK\n")
+
+    servers = []
+    for _ in range(n_recs):
+        line = recv_line(sock)
+        rec = line.split()
+
+        s_type = rec[0]
+        s_id = rec[1]
+        state = rec[2]
+        cur_start = int(rec[3])
+        cores = int(rec[4])
+        mem = int(rec[5])
+        disk = int(rec[6])
+
+        cost = 1.0
+        if len(rec) >= 9:
+            try:
+                cost = float(rec[8])
+            except ValueError:
+                cost = 1.0
+
+        servers.append(
+            {
+                "type": s_type,
+                "id": s_id,
+                "state": state,
+                "cur_start": cur_start,
+                "cores": cores,
+                "mem": mem,
+                "disk": disk,
+                "cost": cost,
+            }
+        )
+
+    # Finish GETS sequence
+    sock.sendall(b"OK\n")
+    _ = recv_line(sock)  # final "."
+
+    return servers
+
+
+def pick_fastest(servers):
+    """
+    Choose the 'fastest' server from a list:
+    - Prefer more cores
+    - On ties, pick lexicographically smallest (type, id).
+    """
+    if not servers:
+        return None
+
+    best = None
+    for s in servers:
+        if best is None:
+            best = s
+            continue
+
+        if s["cores"] > best["cores"]:
+            best = s
+        elif s["cores"] == best["cores"]:
+            if (s["type"], int(s["id"])) < (best["type"], int(best["id"])):
+                best = s
+
+    return best
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--algo",
         required=True,
-        help="Scheduling algorithm name (used locally + sent in AUTH).",
+        help="Scheduling algorithm name (sent in AUTH).",
     )
     parser.add_argument(
         "-p",
@@ -50,7 +132,7 @@ def main():
     sock.sendall(b"HELO\n")
     resp1 = recv_line(sock)
 
-    # We send the algo string in AUTH (as you were already doing)
+    # Send algo string in AUTH (marker reads only SCHD pattern, not this)
     sock.sendall(f"AUTH {args.algo}\n".encode())
     resp2 = recv_line(sock)
 
@@ -63,12 +145,11 @@ def main():
         sock.close()
         sys.exit(1)
 
-    # ===== GETS All: get static server list =====
+    # ===== GETS All (static server list for ECT + fallback) =====
     sock.sendall(b"GETS All\n")
     data_resp = recv_line(sock)
 
-    parts = data_resp.split()
-    if len(parts) < 3 or not data_resp.startswith("DATA"):
+    if not data_resp.startswith("DATA"):
         sock.sendall(b"QUIT\n")
         try:
             recv_line(sock)
@@ -77,28 +158,28 @@ def main():
         sock.close()
         sys.exit(1)
 
+    parts = data_resp.split()
     n_recs = int(parts[1])
 
-    # Acknowledge DATA
     sock.sendall(b"OK\n")
 
-    # Server state: capacity, cost, and an estimated finish_time
-    # Record format (this variant): type id state curStartTime cores mem disk [wJobs rJobs cost ...]
+    # Static info + dynamic finish_time for ECT
     server_state = {}
+    all_servers = []
     max_cost = 0.0
 
     for _ in range(n_recs):
         line = recv_line(sock)
         rec = line.split()
+
         s_type = rec[0]
         s_id = rec[1]
-        # state      = rec[2]  # not used directly
-        cur_start = int(rec[3])  # when this server next starts its current job load
+        state = rec[2]
+        cur_start = int(rec[3])
         cores = int(rec[4])
         mem = int(rec[5])
         disk = int(rec[6])
 
-        # Cost may not be present in all builds; default to 1.0 if missing/invalid
         cost = 1.0
         if len(rec) >= 9:
             try:
@@ -106,31 +187,35 @@ def main():
             except ValueError:
                 cost = 1.0
 
-        server_state[(s_type, s_id)] = {
+        info = {
+            "type": s_type,
+            "id": s_id,
+            "state": state,
+            "cur_start": cur_start,
             "cores": cores,
             "mem": mem,
             "disk": disk,
             "cost": cost,
-            # Estimated time when this server becomes free.
-            # We initialise with cur_start to reflect any initial workload.
+            # For ECT-style we maintain an approximate finish_time
             "finish_time": cur_start,
         }
+        server_state[(s_type, s_id)] = info
+        all_servers.append(info)
+
         if cost > max_cost:
             max_cost = cost
 
-    # Finish GETS All sequence
     sock.sendall(b"OK\n")
     _ = recv_line(sock)  # final "."
 
     if max_cost <= 0:
         max_cost = 1.0
 
-    # ===== Helper: choose server by algorithm =====
-    def choose_server_fc(job_cores, job_mem, job_disk):
-        """
-        Simple FC (First Capable): first server in list that can run the job.
-        This roughly mimics the reference FC behaviour.
-        """
+    # Global time tracker (approx; based on events)
+    current_time = 0
+
+    # ===== Helper: FC (First Capable using static list) =====
+    def choose_fc(job_cores, job_mem, job_disk):
         for key, s in server_state.items():
             if (
                 s["cores"] >= job_cores
@@ -140,18 +225,31 @@ def main():
                 return key
         return None
 
-    def choose_server_ect(job_submit, job_cores, job_mem, job_disk, est_runtime):
-        """
-        ECT-style heuristic:
-        For each capable server, estimate when the job would complete:
-            start_time = max(server.finish_time, job_submit)
-            completion_time = start_time + est_runtime
-        Choose server with minimum completion_time, with a mild cost tie-breaker.
-        """
+    # ===== Helper: FAFC (Fastest Available then Fastest Capable) =====
+    def choose_fafc(job_cores, job_mem, job_disk):
+        # 1. Try GETS Avail
+        avail = gets_servers(sock, f"GETS Avail {job_cores} {job_mem} {job_disk}\n")
+        if avail:
+            fastest = pick_fastest(avail)
+            return (fastest["type"], fastest["id"])
+
+        # 2. If nothing available, GETS Capable
+        capable = gets_servers(sock, f"GETS Capable {job_cores} {job_mem} {job_disk}\n")
+        if capable:
+            fastest = pick_fastest(capable)
+            return (fastest["type"], fastest["id"])
+
+        # 3. Fallback: fastest overall
+        fastest = pick_fastest(all_servers)
+        if fastest is None:
+            return None
+        return (fastest["type"], fastest["id"])
+
+    # ===== Helper: ECT-style (Estimated Completion Time) =====
+    def choose_ect(job_submit, job_cores, job_mem, job_disk, est_runtime):
         best_key = None
         best_score = None
 
-        # Avoid zero runtime (just in case)
         rt = max(est_runtime, 1)
 
         for key, s in server_state.items():
@@ -160,13 +258,14 @@ def main():
                 and s["mem"] >= job_mem
                 and s["disk"] >= job_disk
             ):
-                start_time = max(s["finish_time"], job_submit)
+                # Approximate when this job would start on this server
+                start_time = max(s["finish_time"], job_submit, current_time)
                 completion_time = start_time + rt
 
-                # Base score: completion time
+                # Primary objective: earliest completion
                 score = float(completion_time)
 
-                # Mild cost penalty so cheaper servers are slightly preferred
+                # Slightly penalise expensive servers (tie-breaker)
                 score += 0.001 * s["cost"] * rt
 
                 if best_score is None or score < best_score:
@@ -188,13 +287,26 @@ def main():
 
         parts = event.split()
 
-        # Ignore completion and other non-job events
-        if event.startswith(("JCPL", "RESF", "RESR", "CHKQ")):
+        # Track time from JCPL / JOBN where available
+        if event.startswith("JCPL"):
+            # JCPL time serverType serverID jobID
+            if len(parts) >= 5:
+                t = int(parts[1])
+                s_type = parts[2]
+                s_id = parts[3]
+                current_time = max(current_time, t)
+                key = (s_type, s_id)
+                if key in server_state:
+                    # Server definitely free at time t; don't let our estimate lag behind
+                    server_state[key]["finish_time"] = max(server_state[key]["finish_time"], t)
+            continue
+
+        if event.startswith("RESF") or event.startswith("RESR") or event.startswith("CHKQ"):
             continue
 
         # New or pre-empted job
         if event.startswith("JOBN") or event.startswith("JOBP"):
-            # In this ds-sim variant: JOBN submitTime jobID cores memory disk estRuntime
+            # JOBN submitTime jobID cores memory disk estRuntime  (variant you’re using)
             if len(parts) < 7:
                 continue
 
@@ -205,16 +317,22 @@ def main():
             disk = int(parts[5])
             est_runtime = int(parts[6])
 
-            # Select server according to algorithm
-            if algo == "fc":
-                best_key = choose_server_fc(cores, mem, disk)
-            else:
-                # Default and "ect": use ECT-style heuristic
-                best_key = choose_server_ect(submit_time, cores, mem, disk, est_runtime)
+            # Update global time with submit_time (jobs won’t arrive earlier than this)
+            current_time = max(current_time, submit_time)
 
-            # Fallback: if somehow no capable server found, just use the first one
+            # ===== Choose server based on algo =====
+            if algo == "fc":
+                best_key = choose_fc(cores, mem, disk)
+            elif algo == "fafc":
+                best_key = choose_fafc(cores, mem, disk)
+            else:
+                # default and "ect" → ECT-style heuristic
+                best_key = choose_ect(submit_time, cores, mem, disk, est_runtime)
+
+            # Fallback: if somehow none found, use fastest overall
             if best_key is None:
-                if not server_state:
+                fastest = pick_fastest(all_servers)
+                if fastest is None:
                     sock.sendall(b"QUIT\n")
                     try:
                         recv_line(sock)
@@ -222,23 +340,22 @@ def main():
                         pass
                     sock.close()
                     sys.exit(1)
-                best_key = next(iter(server_state.keys()))
+                best_key = (fastest["type"], fastest["id"])
 
             s_type, s_id = best_key
-            s_info = server_state[best_key]
+            s_info = server_state.get(best_key)
 
-            # Estimate when this job will start and finish on the chosen server
+            # For ECT-style: update finish_time estimate
             rt = max(est_runtime, 1)
-            start_time = max(s_info["finish_time"], submit_time)
-            completion_time = start_time + rt
+            if s_info is not None:
+                start_time = max(s_info["finish_time"], submit_time, current_time)
+                completion_time = start_time + rt
+                s_info["finish_time"] = completion_time
 
             # Send schedule command
             cmd = f"SCHD {job_id} {s_type} {s_id}\n"
             sock.sendall(cmd.encode())
             _ = recv_line(sock)  # expect "OK"
-
-            # Update our estimated finish time for this server
-            s_info["finish_time"] = completion_time
 
             continue
 
