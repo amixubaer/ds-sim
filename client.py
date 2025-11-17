@@ -21,7 +21,7 @@ def main():
     parser.add_argument(
         "--algo",
         required=True,
-        help="Scheduling algorithm name (sent in AUTH).",
+        help="Scheduling algorithm name (used locally + sent in AUTH).",
     )
     parser.add_argument(
         "-p",
@@ -31,6 +31,7 @@ def main():
         help="Port ds-server is listening on (default 50000).",
     )
     args = parser.parse_args()
+    algo = args.algo.lower()
 
     # ===== Connect to server =====
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -49,6 +50,7 @@ def main():
     sock.sendall(b"HELO\n")
     resp1 = recv_line(sock)
 
+    # We send the algo string in AUTH (as you were already doing)
     sock.sendall(f"AUTH {args.algo}\n".encode())
     resp2 = recv_line(sock)
 
@@ -80,7 +82,7 @@ def main():
     # Acknowledge DATA
     sock.sendall(b"OK\n")
 
-    # Server state: capacity, cost, and heuristic "load"
+    # Server state: capacity, cost, and an estimated finish_time
     # Record format (this variant): type id state curStartTime cores mem disk [wJobs rJobs cost ...]
     server_state = {}
     max_cost = 0.0
@@ -90,6 +92,8 @@ def main():
         rec = line.split()
         s_type = rec[0]
         s_id = rec[1]
+        # state      = rec[2]  # not used directly
+        cur_start = int(rec[3])  # when this server next starts its current job load
         cores = int(rec[4])
         mem = int(rec[5])
         disk = int(rec[6])
@@ -107,7 +111,9 @@ def main():
             "mem": mem,
             "disk": disk,
             "cost": cost,
-            "load": 0.0,  # heuristic total core-time load
+            # Estimated time when this server becomes free.
+            # We initialise with cur_start to reflect any initial workload.
+            "finish_time": cur_start,
         }
         if cost > max_cost:
             max_cost = cost
@@ -119,7 +125,57 @@ def main():
     if max_cost <= 0:
         max_cost = 1.0
 
-    # ===== Main scheduling loop: load-balanced heuristic =====
+    # ===== Helper: choose server by algorithm =====
+    def choose_server_fc(job_cores, job_mem, job_disk):
+        """
+        Simple FC (First Capable): first server in list that can run the job.
+        This roughly mimics the reference FC behaviour.
+        """
+        for key, s in server_state.items():
+            if (
+                s["cores"] >= job_cores
+                and s["mem"] >= job_mem
+                and s["disk"] >= job_disk
+            ):
+                return key
+        return None
+
+    def choose_server_ect(job_submit, job_cores, job_mem, job_disk, est_runtime):
+        """
+        ECT-style heuristic:
+        For each capable server, estimate when the job would complete:
+            start_time = max(server.finish_time, job_submit)
+            completion_time = start_time + est_runtime
+        Choose server with minimum completion_time, with a mild cost tie-breaker.
+        """
+        best_key = None
+        best_score = None
+
+        # Avoid zero runtime (just in case)
+        rt = max(est_runtime, 1)
+
+        for key, s in server_state.items():
+            if (
+                s["cores"] >= job_cores
+                and s["mem"] >= job_mem
+                and s["disk"] >= job_disk
+            ):
+                start_time = max(s["finish_time"], job_submit)
+                completion_time = start_time + rt
+
+                # Base score: completion time
+                score = float(completion_time)
+
+                # Mild cost penalty so cheaper servers are slightly preferred
+                score += 0.001 * s["cost"] * rt
+
+                if best_score is None or score < best_score:
+                    best_score = score
+                    best_key = key
+
+        return best_key
+
+    # ===== Main scheduling loop =====
     while True:
         sock.sendall(b"REDY\n")
         event = recv_line(sock)
@@ -132,7 +188,7 @@ def main():
 
         parts = event.split()
 
-        # Ignore completion and other non-job events (no need to model exact finish times)
+        # Ignore completion and other non-job events
         if event.startswith(("JCPL", "RESF", "RESR", "CHKQ")):
             continue
 
@@ -142,32 +198,19 @@ def main():
             if len(parts) < 7:
                 continue
 
-            submit_time = int(parts[1])      # not used in heuristic, but correct position
+            submit_time = int(parts[1])
             job_id = parts[2]
             cores = int(parts[3])
             mem = int(parts[4])
             disk = int(parts[5])
             est_runtime = int(parts[6])
 
-            # Choose server with minimal heuristic "load" among capable servers.
-            best_key = None
-            best_score = None
-
-            for key, s in server_state.items():
-                if (
-                    s["cores"] >= cores
-                    and s["mem"] >= mem
-                    and s["disk"] >= disk
-                ):
-                    # Base score: current total core-time load on this server
-                    score = s["load"]
-
-                    # Mild cost tie-breaker: prefer cheaper servers if loads similar
-                    score += 0.001 * s["cost"] * cores * max(est_runtime, 1)
-
-                    if best_score is None or score < best_score:
-                        best_score = score
-                        best_key = key
+            # Select server according to algorithm
+            if algo == "fc":
+                best_key = choose_server_fc(cores, mem, disk)
+            else:
+                # Default and "ect": use ECT-style heuristic
+                best_key = choose_server_ect(submit_time, cores, mem, disk, est_runtime)
 
             # Fallback: if somehow no capable server found, just use the first one
             if best_key is None:
@@ -182,14 +225,20 @@ def main():
                 best_key = next(iter(server_state.keys()))
 
             s_type, s_id = best_key
+            s_info = server_state[best_key]
+
+            # Estimate when this job will start and finish on the chosen server
+            rt = max(est_runtime, 1)
+            start_time = max(s_info["finish_time"], submit_time)
+            completion_time = start_time + rt
 
             # Send schedule command
             cmd = f"SCHD {job_id} {s_type} {s_id}\n"
             sock.sendall(cmd.encode())
             _ = recv_line(sock)  # expect "OK"
 
-            # Update heuristic load: cores * runtime
-            server_state[best_key]["load"] += cores * max(est_runtime, 1)
+            # Update our estimated finish time for this server
+            s_info["finish_time"] = completion_time
 
             continue
 
