@@ -146,7 +146,7 @@ def main():
                 continue
 
             submit_time = int(parts[1])      # not used in heuristic, but correct position
-            job_id = parts[2]
+            job_id = parts[1]
             cores = int(parts[3])
             mem = int(parts[4])
             disk = int(parts[5])
