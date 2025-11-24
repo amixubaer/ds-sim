@@ -19,7 +19,6 @@ def send(sock, msg):
 
 
 def parse_server(line):
-    # type id state curStartTime cores mem disk wJobs rJobs
     p = line.split()
     return {
         "type": p[0],
@@ -46,7 +45,9 @@ def gets(sock, cmd):
 
     servers = []
     for _ in range(n):
-        servers.append(parse_server(recv_line(sock)))
+        line = recv_line(sock)
+        if line:
+            servers.append(parse_server(line))
 
     send(sock, "OK")
     _ = recv_line(sock)  # final "."
@@ -54,7 +55,6 @@ def gets(sock, cmd):
 
 
 def state_priority(state: str) -> int:
-    # lower is better
     if state == "idle":
         return 0
     if state == "active":
@@ -67,7 +67,6 @@ def state_priority(state: str) -> int:
 
 
 def best_fit(servers, cores, mem, disk):
-    # smallest leftover resources among candidates
     return min(
         servers,
         key=lambda s: (
@@ -81,7 +80,6 @@ def best_fit(servers, cores, mem, disk):
 
 
 def best_ect(servers, est_runtime, cores, mem, disk):
-    # estimated completion time proxy
     def ect_score(s):
         queue = s["wJobs"] + s["rJobs"]
         ect = queue * est_runtime + est_runtime
@@ -89,6 +87,28 @@ def best_ect(servers, est_runtime, cores, mem, disk):
         return (ect, state_priority(s["state"]), fit, s["type"], s["id"])
 
     return min(servers, key=ect_score)
+
+
+def parse_job(parts, max_cores, max_mem, max_disk):
+    """
+    Supports BOTH JOBN formats:
+    A) JOBN submit id est cores mem disk
+    B) JOBN submit id cores mem disk est
+    """
+    submit = int(parts[1])
+    jid = int(parts[2])
+
+    a = int(parts[3])
+    b = int(parts[4])
+    c = int(parts[5])
+    d = int(parts[6])
+
+    if a <= max_cores and b <= max_mem and c <= max_disk:
+        cores, mem, disk, est = a, b, c, d
+    else:
+        est, cores, mem, disk = a, b, c, d
+
+    return jid, est, cores, mem, disk
 
 
 def main():
@@ -100,7 +120,7 @@ def main():
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.connect(("localhost", args.port))
 
-    # optional initial line (when ds-server not using -n)
+    # optional banner
     sock.settimeout(0.2)
     try:
         _ = recv_line(sock)
@@ -112,9 +132,19 @@ def main():
     send(sock, "HELO")
     recv_line(sock)
 
-    # AUTH must be username, NOT algo
-    send(sock, "AUTH AbuJubaer")
+    send(sock, "AUTH AbuJubaer")  # username only
     recv_line(sock)
+
+    # ---- Get static servers + bounds ----
+    all_servers = gets(sock, "GETS All")
+    if not all_servers:
+        send(sock, "QUIT")
+        sock.close()
+        return
+
+    max_cores = max(s["cores"] for s in all_servers)
+    max_mem = max(s["mem"] for s in all_servers)
+    max_disk = max(s["disk"] for s in all_servers)
 
     # ---- Main loop ----
     while True:
@@ -129,22 +159,24 @@ def main():
 
         if event.startswith(("JOBN", "JOBP")):
             parts = event.split()
+            if len(parts) < 7:
+                continue
 
-            # correct JOBN format:
-            # JOBN submitTime jobID estRuntime cores mem disk
-            job_id = int(parts[2])
-            est_runtime = int(parts[3])
-            cores = int(parts[4])
-            mem = int(parts[5])
-            disk = int(parts[6])
+            job_id, est_runtime, cores, mem, disk = parse_job(
+                parts, max_cores, max_mem, max_disk
+            )
 
-            # 1) Avail first
+            # Avail first
             avail = gets(sock, f"GETS Avail {cores} {mem} {disk}")
             if avail:
                 chosen = best_fit(avail, cores, mem, disk)
             else:
                 capable = gets(sock, f"GETS Capable {cores} {mem} {disk}")
-                chosen = best_ect(capable, est_runtime, cores, mem, disk)
+                if capable:
+                    chosen = best_ect(capable, est_runtime, cores, mem, disk)
+                else:
+                    # ultra-safe fallback
+                    chosen = best_fit(all_servers, cores, mem, disk)
 
             send(sock, f"SCHD {job_id} {chosen['type']} {chosen['id']}")
             recv_line(sock)
@@ -155,7 +187,6 @@ def main():
     except Exception:
         pass
     sock.close()
-    sys.exit(0)
 
 
 if __name__ == "__main__":
