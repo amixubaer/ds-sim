@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
-
 import socket
 import sys
 import argparse
 
 
 def recv_line(sock):
-    """Receive a single newline-terminated line from the socket."""
     data = b""
     while not data.endswith(b"\n"):
         chunk = sock.recv(1)
@@ -16,196 +14,146 @@ def recv_line(sock):
     return data.decode().strip()
 
 
+def send(sock, msg):
+    sock.sendall((msg + "\n").encode())
+
+
+def parse_server(line):
+    # type id state curStartTime cores mem disk wJobs rJobs
+    p = line.split()
+    return {
+        "type": p[0],
+        "id": int(p[1]),
+        "state": p[2],
+        "start": int(p[3]),
+        "cores": int(p[4]),
+        "mem": int(p[5]),
+        "disk": int(p[6]),
+        "wJobs": int(p[7]) if len(p) > 7 else 0,
+        "rJobs": int(p[8]) if len(p) > 8 else 0,
+    }
+
+
+def gets(sock, cmd):
+    send(sock, cmd)
+    header = recv_line(sock)
+
+    if not header.startswith("DATA"):
+        return []
+
+    n = int(header.split()[1])
+    send(sock, "OK")
+
+    servers = []
+    for _ in range(n):
+        servers.append(parse_server(recv_line(sock)))
+
+    send(sock, "OK")
+    _ = recv_line(sock)  # final "."
+    return servers
+
+
+def state_priority(state: str) -> int:
+    # lower is better
+    if state == "idle":
+        return 0
+    if state == "active":
+        return 1
+    if state == "booting":
+        return 2
+    if state == "inactive":
+        return 3
+    return 4
+
+
+def best_fit(servers, cores, mem, disk):
+    # smallest leftover resources among candidates
+    return min(
+        servers,
+        key=lambda s: (
+            (s["cores"] - cores),
+            (s["mem"] - mem),
+            (s["disk"] - disk),
+            s["type"],
+            s["id"],
+        ),
+    )
+
+
+def best_ect(servers, est_runtime, cores, mem, disk):
+    # estimated completion time proxy
+    def ect_score(s):
+        queue = s["wJobs"] + s["rJobs"]
+        ect = queue * est_runtime + est_runtime
+        fit = (s["cores"] - cores)
+        return (ect, state_priority(s["state"]), fit, s["type"], s["id"])
+
+    return min(servers, key=ect_score)
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--algo",
-        required=True,
-        help="Scheduling algorithm name (sent in AUTH).",
-    )
-    parser.add_argument(
-        "-p",
-        "--port",
-        type=int,
-        default=50000,
-        help="Port ds-server is listening on (default 50000).",
-    )
+    parser.add_argument("--algo", required=True)
+    parser.add_argument("-p", "--port", type=int, default=50000)
     args = parser.parse_args()
 
-    # ===== Connect to server =====
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.connect(("localhost", args.port))
 
-    # Some ds-server builds send an initial line; others (with -n) do not.
-    # Try to read one line with a short timeout; if nothing, ignore.
+    # optional initial line (when ds-server not using -n)
     sock.settimeout(0.2)
-    try:
-        _ = recv_line(sock)
-    except (socket.timeout, OSError):
-        pass
-    finally:
-        sock.settimeout(None)
-
-    # ===== Handshake =====
-    sock.sendall(b"HELO\n")
-    resp1 = recv_line(sock)
-
-    sock.sendall(f"AUTH {args.algo}\n".encode())
-    resp2 = recv_line(sock)
-
-    if resp1 != "OK" or resp2 != "OK":
-        sock.sendall(b"QUIT\n")
-        try:
-            recv_line(sock)
-        except Exception:
-            pass
-        sock.close()
-        sys.exit(1)
-
-        print(">>> HANDSHAKE SUCCESSFUL <<<", file=sys.stderr)  
-
-    # ===== GETS All: get static server list =====
-    sock.sendall(b"GETS All\n")
-    data_resp = recv_line(sock)
-
-    parts = data_resp.split()
-    if len(parts) < 3 or not data_resp.startswith("DATA"):
-        sock.sendall(b"QUIT\n")
-        try:
-            recv_line(sock)
-        except Exception:
-            pass
-        sock.close()
-        sys.exit(1)
-
-    n_recs = int(parts[1])
-
-    # Acknowledge DATA
-    sock.sendall(b"OK\n")
-
-    # Server state: capacity, cost, and heuristic "load"
-    # Record format (this variant): type id state curStartTime cores mem disk [wJobs rJobs cost ...]
-    server_state = {}
-    max_cost = 0.0
-
-    for _ in range(n_recs):
-        line = recv_line(sock)
-        rec = line.split()
-        s_type = rec[0]
-        s_id = rec[1]
-        cores = int(rec[4])
-        mem = int(rec[5])
-        disk = int(rec[6])
-
-        # Cost may not be present in all builds; default to 1.0 if missing/invalid
-        cost = 1.0
-        if len(rec) >= 9:
-            try:
-                cost = float(rec[8])
-            except ValueError:
-                cost = 1.0
-
-        server_state[(s_type, s_id)] = {
-            "cores": cores,
-            "mem": mem,
-            "disk": disk,
-            "cost": cost,
-            "load": 0.0,  # heuristic total core-time load
-        }
-        if cost > max_cost:
-            max_cost = cost
-
-    # Finish GETS All sequence
-    sock.sendall(b"OK\n")
-    _ = recv_line(sock)  # final "."
-
-    if max_cost <= 0:
-        max_cost = 1.0
-
-    # ===== Main scheduling loop: load-balanced heuristic =====
-    while True:
-        sock.sendall(b"REDY\n")
-        event = recv_line(sock)
-
-        if not event:
-            break
-
-        if event == "NONE":
-            break
-
-        parts = event.split()
-
-        # Ignore completion and other non-job events (no need to model exact finish times)
-        if event.startswith(("JCPL", "RESF", "RESR", "CHKQ")):
-            continue
-
-        # New or pre-empted job
-        if event.startswith("JOBN") or event.startswith("JOBP"):
-            # In this ds-sim variant: JOBN submitTime jobID cores memory disk estRuntime
-            if len(parts) < 7:
-                continue
-
-            submit_time = int(parts[1])      # not used in heuristic, but correct position
-            job_id = parts[1]
-            cores = int(parts[3])
-            mem = int(parts[4])
-            disk = int(parts[5])
-            est_runtime = int(parts[6])
-
-            # Choose server with minimal heuristic "load" among capable servers.
-            best_key = None
-            best_score = None
-
-            for key, s in server_state.items():
-                if (
-                    s["cores"] >= cores
-                    and s["mem"] >= mem
-                    and s["disk"] >= disk
-                ):
-                    # Base score: current total core-time load on this server
-                    score = s["load"]
-
-                    # Mild cost tie-breaker: prefer cheaper servers if loads similar
-                    # (no need to over-penalise cost; turnaround is main objective)
-                    score += 0.001 * s["cost"] * cores * max(est_runtime, 1)
-
-                    if best_score is None or score < best_score:
-                        best_score = score
-                        best_key = key
-
-            # Fallback: if somehow no capable server found, just use the first one
-            if best_key is None:
-                if not server_state:
-                    sock.sendall(b"QUIT\n")
-                    try:
-                        recv_line(sock)
-                    except Exception:
-                        pass
-                    sock.close()
-                    sys.exit(1)
-                best_key = next(iter(server_state.keys()))
-
-            s_type, s_id = best_key
-
-            # Send schedule command
-            cmd = f"SCHD {job_id} {s_type} {s_id}\n"
-            sock.sendall(cmd.encode())
-            _ = recv_line(sock)  # expect "OK"
-
-            # Update heuristic load: cores * runtime
-            server_state[best_key]["load"] += cores * max(est_runtime, 1)
-
-            continue
-
-        # Any other event types are ignored
-
-    # ===== Clean shutdown =====
-    sock.sendall(b"QUIT\n")
     try:
         _ = recv_line(sock)
     except Exception:
         pass
+    sock.settimeout(None)
 
+    # ---- Handshake ----
+    send(sock, "HELO")
+    recv_line(sock)
+
+    # AUTH must be username, NOT algo
+    send(sock, "AUTH AbuJubaer")
+    recv_line(sock)
+
+    # ---- Main loop ----
+    while True:
+        send(sock, "REDY")
+        event = recv_line(sock)
+
+        if not event or event == "NONE":
+            break
+
+        if event.startswith(("JCPL", "RESF", "RESR", "CHKQ")):
+            continue
+
+        if event.startswith(("JOBN", "JOBP")):
+            parts = event.split()
+
+            # correct JOBN format:
+            # JOBN submitTime jobID estRuntime cores mem disk
+            job_id = int(parts[2])
+            est_runtime = int(parts[3])
+            cores = int(parts[4])
+            mem = int(parts[5])
+            disk = int(parts[6])
+
+            # 1) Avail first
+            avail = gets(sock, f"GETS Avail {cores} {mem} {disk}")
+            if avail:
+                chosen = best_fit(avail, cores, mem, disk)
+            else:
+                capable = gets(sock, f"GETS Capable {cores} {mem} {disk}")
+                chosen = best_ect(capable, est_runtime, cores, mem, disk)
+
+            send(sock, f"SCHD {job_id} {chosen['type']} {chosen['id']}")
+            recv_line(sock)
+
+    send(sock, "QUIT")
+    try:
+        recv_line(sock)
+    except Exception:
+        pass
     sock.close()
     sys.exit(0)
 
