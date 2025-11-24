@@ -18,7 +18,11 @@ def send(sock, msg):
     sock.sendall((msg + "\n").encode())
 
 
+# -------------------------
+# Parse server record
+# -------------------------
 def parse_server(line):
+    
     p = line.split()
     return {
         "type": p[0],
@@ -33,6 +37,9 @@ def parse_server(line):
     }
 
 
+# -------------------------
+# GETS helper
+# -------------------------
 def gets(sock, cmd):
     send(sock, cmd)
     header = recv_line(sock)
@@ -54,7 +61,11 @@ def gets(sock, cmd):
     return servers
 
 
+# -------------------------
+# State priority (cost + util aware)
+# -------------------------
 def state_priority(state: str) -> int:
+    # lower is better (prefer already-on servers)
     if state == "idle":
         return 0
     if state == "active":
@@ -66,7 +77,35 @@ def state_priority(state: str) -> int:
     return 4
 
 
-def best_fit(servers, cores, mem, disk):
+# -------------------------
+# Robust JOBN parser
+# -------------------------
+def parse_job(parts, max_cores, max_mem, max_disk):
+    """
+    Supports 2 JOBN formats:
+    A) JOBN submit id est cores mem disk
+    B) JOBN submit id cores mem disk est
+    """
+    jid = int(parts[2])
+
+    a = int(parts[3])
+    b = int(parts[4])
+    c = int(parts[5])
+    d = int(parts[6])
+
+    # Detect if 'a' looks like cores
+    if a <= max_cores and b <= max_mem and c <= max_disk:
+        cores, mem, disk, est = a, b, c, d
+    else:
+        est, cores, mem, disk = a, b, c, d
+
+    return jid, est, cores, mem, disk
+
+
+# -------------------------
+# Avail choice: Best Fit
+# -------------------------
+def choose_best_fit(servers, cores, mem, disk):
     return min(
         servers,
         key=lambda s: (
@@ -79,36 +118,41 @@ def best_fit(servers, cores, mem, disk):
     )
 
 
-def best_ect(servers, est_runtime, cores, mem, disk):
-    def ect_score(s):
-        queue = s["wJobs"] + s["rJobs"]
-        ect = queue * est_runtime + est_runtime
-        fit = (s["cores"] - cores)
-        return (ect, state_priority(s["state"]), fit, s["type"], s["id"])
-
-    return min(servers, key=ect_score)
-
-
-def parse_job(parts, max_cores, max_mem, max_disk):
+# -------------------------
+# Capable choice: Optimized ECT + cost/util
+# -------------------------
+def choose_optimized(servers, est, cores, mem, disk):
     """
-    Supports BOTH JOBN formats:
-    A) JOBN submit id est cores mem disk
-    B) JOBN submit id cores mem disk est
+    Score components:
+    1. ECT proxy:
+       ect = est * (1 + wJobs + 0.5*rJobs)
+    2. State penalty:
+       booting/inactive cost more -> avoid unless needed
+    3. Best-fit leftover:
+       discourage wasting huge servers
     """
-    submit = int(parts[1])
-    jid = int(parts[2])
+    def score(s):
+        w = s["wJobs"]
+        r = s["rJobs"]
 
-    a = int(parts[3])
-    b = int(parts[4])
-    c = int(parts[5])
-    d = int(parts[6])
+        ect = est * (1 + w + 0.5 * r)
 
-    if a <= max_cores and b <= max_mem and c <= max_disk:
-        cores, mem, disk, est = a, b, c, d
-    else:
-        est, cores, mem, disk = a, b, c, d
+        # keep servers already running
+        st_pen = state_priority(s["state"]) * est * 2
 
-    return jid, est, cores, mem, disk
+        # best-fit penalty (small)
+        leftover = (s["cores"] - cores)
+        fit_pen = leftover * 0.1 * est
+
+        return (
+            ect + st_pen + fit_pen,
+            state_priority(s["state"]),
+            leftover,
+            s["type"],
+            s["id"],
+        )
+
+    return min(servers, key=score)
 
 
 def main():
@@ -120,7 +164,7 @@ def main():
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.connect(("localhost", args.port))
 
-    # optional banner
+
     sock.settimeout(0.2)
     try:
         _ = recv_line(sock)
@@ -132,10 +176,10 @@ def main():
     send(sock, "HELO")
     recv_line(sock)
 
-    send(sock, "AUTH AbuJubaer")  # username only
+    send(sock, "AUTH AbuJubaer")   
     recv_line(sock)
 
-    # ---- Get static servers + bounds ----
+    # ---- Static server list to get bounds ----
     all_servers = gets(sock, "GETS All")
     if not all_servers:
         send(sock, "QUIT")
@@ -162,23 +206,23 @@ def main():
             if len(parts) < 7:
                 continue
 
-            job_id, est_runtime, cores, mem, disk = parse_job(
+            jid, est, cores, mem, disk = parse_job(
                 parts, max_cores, max_mem, max_disk
             )
 
-            # Avail first
+            # 1) Try Avail first
             avail = gets(sock, f"GETS Avail {cores} {mem} {disk}")
             if avail:
-                chosen = best_fit(avail, cores, mem, disk)
+                chosen = choose_best_fit(avail, cores, mem, disk)
             else:
                 capable = gets(sock, f"GETS Capable {cores} {mem} {disk}")
                 if capable:
-                    chosen = best_ect(capable, est_runtime, cores, mem, disk)
+                    chosen = choose_optimized(capable, est, cores, mem, disk)
                 else:
                     # ultra-safe fallback
-                    chosen = best_fit(all_servers, cores, mem, disk)
+                    chosen = choose_best_fit(all_servers, cores, mem, disk)
 
-            send(sock, f"SCHD {job_id} {chosen['type']} {chosen['id']}")
+            send(sock, f"SCHD {jid} {chosen['type']} {chosen['id']}")
             recv_line(sock)
 
     send(sock, "QUIT")
@@ -187,6 +231,7 @@ def main():
     except Exception:
         pass
     sock.close()
+    sys.exit(0)
 
 
 if __name__ == "__main__":
