@@ -62,7 +62,6 @@ def gets(sock, cmd):
 
 
 def state_priority(state: str) -> int:
-    # lower is better (prefer already-on servers)
     if state == "idle":
         return 0
     if state == "active":
@@ -88,7 +87,6 @@ def parse_job(parts, max_cores, max_mem, max_disk):
     c = int(parts[5])
     d = int(parts[6])
 
-    # If a looks like cores and b/c fit mem/disk bounds => format B
     if a <= max_cores and b <= max_mem and c <= max_disk:
         cores, mem, disk, est_runtime = a, b, c, d
     else:
@@ -98,7 +96,6 @@ def parse_job(parts, max_cores, max_mem, max_disk):
 
 
 def choose_best_fit(servers, cores, mem, disk):
-    """Best-Fit among available servers."""
     return min(
         servers,
         key=lambda s: (
@@ -112,23 +109,12 @@ def choose_best_fit(servers, cores, mem, disk):
 
 
 def choose_optimized(servers, est, cores, mem, disk):
-    """
-    Optimized ECT hybrid:
-    - estimated completion time proxy using queue
-    - prefer active/idle servers (lower cost)
-    - best-fit tie-break to avoid wasting big servers
-    """
     def score(s):
         w = s["wJobs"]
         r = s["rJobs"]
 
-        # estimated completion time proxy
         ect = est * (1 + w + 0.5 * r)
-
-        # penalty for turning on new servers
         st_pen = state_priority(s["state"]) * est * 2
-
-        # mild best-fit penalty
         leftover = (s["cores"] - cores)
         fit_pen = leftover * 0.1 * est
 
@@ -145,19 +131,18 @@ def choose_optimized(servers, est, cores, mem, disk):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--algo", required=True, help="Algo name (only for your tracking).")
+    parser.add_argument("--algo", required=True)
     parser.add_argument("-p", "--port", type=int, default=50000)
-    parser.add_argument("--user", default="student", help="Username for AUTH.")
-    parser.add_argument("--debug", action="store_true", help="Print JOBN / SCHD events.")
+    parser.add_argument("--user", default="student")
+    parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
-
     debug = args.debug
 
-    # ===== Connect to server =====
+    # ===== Connect =====
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.connect(("localhost", args.port))
 
-    # optional initial banner (when ds-server not using -n)
+    # optional banner
     sock.settimeout(0.2)
     try:
         _ = recv_line(sock)
@@ -166,25 +151,30 @@ def main():
     sock.settimeout(None)
 
     # ===== Handshake =====
-    send_line(sock, "HELO")
-    resp1 = recv_line(sock)
+    try:
+        send_line(sock, "HELO")
+        resp1 = recv_line(sock)
 
-    send_line(sock, f"AUTH {args.user}")  # MUST be username
-    resp2 = recv_line(sock)
-
-    if resp1 != "OK" or resp2 != "OK":
-        send_line(sock, "QUIT")
-        try:
-            recv_line(sock)
-        except Exception:
-            pass
+        send_line(sock, f"AUTH {args.user}")
+        resp2 = recv_line(sock)
+    except BrokenPipeError:
+        print("Handshake failed: server closed connection early.", file=sys.stderr)
         sock.close()
         sys.exit(1)
 
-    # ===== GETS All (bounds only) =====
+    if debug:
+        print("HANDSHAKE RESP1:", resp1, file=sys.stderr)
+        print("HANDSHAKE RESP2:", resp2, file=sys.stderr)
+
+    if resp1 != "OK" or resp2 != "OK":
+        # IMPORTANT: don't send QUIT here; server already might have closed
+        print("Handshake failed. Exiting.", file=sys.stderr)
+        sock.close()
+        sys.exit(1)
+
+    # ===== bounds from GETS All =====
     all_servers = gets(sock, "GETS All")
     if not all_servers:
-        send_line(sock, "QUIT")
         sock.close()
         sys.exit(1)
 
@@ -192,7 +182,7 @@ def main():
     max_mem = max(s["mem"] for s in all_servers)
     max_disk = max(s["disk"] for s in all_servers)
 
-    # ===== Main scheduling loop =====
+    # ===== Main loop =====
     while True:
         send_line(sock, "REDY")
         event = recv_line(sock)
@@ -203,7 +193,6 @@ def main():
         if not event or event == "NONE":
             break
 
-        # Ignore completion / resource messages
         if event.startswith(("JCPL", "RESF", "RESR", "CHKQ")):
             continue
 
@@ -212,11 +201,10 @@ def main():
             if len(parts) < 7:
                 continue
 
-            submit_time, job_id, est, cores, mem, disk = parse_job(
+            submit, jid, est, cores, mem, disk = parse_job(
                 parts, max_cores, max_mem, max_disk
             )
 
-            # 1) Avail first
             avail = gets(sock, f"GETS Avail {cores} {mem} {disk}")
             if avail:
                 chosen = choose_best_fit(avail, cores, mem, disk)
@@ -228,23 +216,18 @@ def main():
                     chosen = choose_best_fit(all_servers, cores, mem, disk)
 
             if debug:
-                print(
-                    f"SEND: SCHD {job_id} {chosen['type']} {chosen['id']}",
-                    file=sys.stderr
-                )
+                print(f"SEND: SCHD {jid} {chosen['type']} {chosen['id']}", file=sys.stderr)
 
-            send_line(sock, f"SCHD {job_id} {chosen['type']} {chosen['id']}")
-            _ = recv_line(sock)  # expect OK
+            send_line(sock, f"SCHD {jid} {chosen['type']} {chosen['id']}")
+            recv_line(sock)
 
     # ===== Clean shutdown =====
-    send_line(sock, "QUIT")
     try:
+        send_line(sock, "QUIT")
         recv_line(sock)
     except Exception:
         pass
-
     sock.close()
-    sys.exit(0)
 
 
 if __name__ == "__main__":
