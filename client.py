@@ -2,7 +2,7 @@ import socket
 
 HOST = "127.0.0.1"
 PORT = 50000
-USER = "chist"
+USER = "ABC"
 
 # ---------------------------------------------------------
 # Basic network helpers
@@ -85,7 +85,7 @@ def main():
         return
 
     # Handshake
-    send(sock, "HELO")
+    send(sock, "HELO\n")
     if receive(sock) != "OK":
         sock.close()
         return
