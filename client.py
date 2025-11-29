@@ -26,146 +26,187 @@ def main():
     parser.add_argument(
         "-p",
         "--port",
-        type=int,
+        type=int, 
         default=50000,
         help="Port ds-server is listening on (default 50000).",
     )
     args = parser.parse_args()
 
-    # ===== Connect to server =====
+    # Connect to server
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.connect(("localhost", args.port))
 
-    # Handle initial message if present
-    sock.settimeout(0.2)
-    try:
-        _ = recv_line(sock)
-    except (socket.timeout, OSError):
-        pass
-    finally:
-        sock.settimeout(None)
-
-    # ===== Handshake =====
+    # ===== PROTOCOL STEP 1-2: HELO handshake =====
     sock.sendall(b"HELO\n")
-    resp1 = recv_line(sock)
+    response = recv_line(sock)
+    if response != "OK":
+        print(f"HELO failed: {response}", file=sys.stderr)
+        sock.close()
+        return
 
+    # ===== PROTOCOL STEP 3-4: AUTH handshake =====  
     sock.sendall(f"AUTH {args.algo}\n".encode())
-    resp2 = recv_line(sock)
-
-    if resp1 != "OK" or resp2 != "OK":
-        sock.sendall(b"QUIT\n")
-        try:
-            recv_line(sock)
-        except Exception:
-            pass
+    response = recv_line(sock)
+    if response != "OK":
+        print(f"AUTH failed: {response}", file=sys.stderr)
         sock.close()
-        sys.exit(1)
+        return
 
-    print(">>> HANDSHAKE SUCCESSFUL <<<", file=sys.stderr)
+    print("Handshake successful", file=sys.stderr)
 
-    # ===== GETS All: get static server list =====
+    # ===== Get server information =====
     sock.sendall(b"GETS All\n")
-    data_resp = recv_line(sock)
-
-    parts = data_resp.split()
-    if len(parts) < 3 or not data_resp.startswith("DATA"):
-        sock.sendall(b"QUIT\n")
-        try:
-            recv_line(sock)
-        except Exception:
-            pass
+    data_line = recv_line(sock)
+    
+    if not data_line.startswith("DATA"):
+        print(f"GETS All failed: {data_line}", file=sys.stderr)
         sock.close()
-        sys.exit(1)
-
-    n_recs = int(parts[1])
-
-    # Acknowledge DATA
+        return
+        
+    n_recs = int(data_line.split()[1])
     sock.sendall(b"OK\n")
 
-    # Server state storage
-    server_state = {}
-
+    # Read server records
+    servers = []
     for _ in range(n_recs):
         line = recv_line(sock)
-        rec = line.split()
-        if len(rec) < 7:
-            continue
-            
-        s_type = rec[0]
-        s_id = rec[1]
-        cores = int(rec[4])
-        mem = int(rec[5])
-        disk = int(rec[6])
-
-        server_state[(s_type, s_id)] = {
-            "cores": cores,
-            "mem": mem,
-            "disk": disk,
-        }
-
-    # Finish GETS All sequence
+        parts = line.split()
+        if len(parts) >= 7:
+            servers.append({
+                'type': parts[0],
+                'id': parts[1], 
+                'state': parts[2],
+                'curStartTime': parts[3],
+                'cores': int(parts[4]),
+                'memory': int(parts[5]),
+                'disk': int(parts[6])
+            })
+    
     sock.sendall(b"OK\n")
-    _ = recv_line(sock)  # final "."
+    dot_line = recv_line(sock)  # Read the final "."
 
-    # ===== Main scheduling loop =====
+    print(f"Found {len(servers)} servers", file=sys.stderr)
+
+    # ===== PROTOCOL STEP 5: Main event loop =====
     while True:
+        # Send REDY to request next event
         sock.sendall(b"REDY\n")
+        
+        # ===== PROTOCOL STEP 6: Receive event from server =====
         event = recv_line(sock)
-
+        
+        if event == "NONE":
+            print("No more jobs", file=sys.stderr)
+            break
         if not event:
             break
 
-        if event == "NONE":
-            break
-
         parts = event.split()
-
-        # Handle job completion and other events
-        if event.startswith(("JCPL", "RESF", "RESR", "CHKQ")):
-            continue
-
-        # New or pre-empted job - THIS IS WHAT YOU RECEIVE FROM SERVER
-        if event.startswith("JOBN") or event.startswith("JOBP"):
+        
+        # ===== Handle JOBN event (new job) =====
+        if event.startswith("JOBN"):
             if len(parts) < 7:
+                print(f"Invalid JOBN: {event}", file=sys.stderr)
                 continue
-
-            # Parse the job information FROM SERVER
+                
+            # Parse JOBN format: JOBN submitTime jobID cores memory disk estRunTime
+            submit_time = parts[1]
             job_id = parts[2]
             cores = int(parts[3])
-            mem = int(parts[4])
+            memory = int(parts[4]) 
             disk = int(parts[5])
-
-            # Find first capable server (simple algorithm)
-            best_server = None
-            for server_key, server in server_state.items():
-                if (server["cores"] >= cores and 
-                    server["mem"] >= mem and 
-                    server["disk"] >= disk):
-                    best_server = server_key
-                    break
-
-            if best_server is None:
-                # No capable server found
+            est_runtime = parts[6]
+            
+            print(f"JOBN received: job_id={job_id}, cores={cores}, memory={memory}, disk={disk}", file=sys.stderr)
+            
+            # Find first capable server
+            scheduled = False
+            for server in servers:
+                if (server['cores'] >= cores and 
+                    server['memory'] >= memory and 
+                    server['disk'] >= disk):
+                    
+                    # ===== PROTOCOL STEP 7: Send SCHD command =====
+                    cmd = f"SCHD {job_id} {server['type']} {server['id']}\n"
+                    sock.sendall(cmd.encode())
+                    
+                    # ===== PROTOCOL STEP 8: Wait for OK response =====
+                    response = recv_line(sock)
+                    if response == "OK":
+                        print(f"Scheduled job {job_id} to {server['type']} {server['id']}", file=sys.stderr)
+                        scheduled = True
+                        break
+                    else:
+                        print(f"SCHD failed: {response}", file=sys.stderr)
+            
+            if not scheduled:
+                print(f"Could not schedule job {job_id}", file=sys.stderr)
+                # Send ENQJ to put job in global queue as fallback
+                sock.sendall(b"ENQJ GQ\n")
+                response = recv_line(sock)
+        
+        # ===== Handle JOBP event (resubmitted job) =====
+        elif event.startswith("JOBP"):
+            if len(parts) < 7:
+                print(f"Invalid JOBP: {event}", file=sys.stderr)
                 continue
+                
+            # Parse JOBP format: JOBP submitTime jobID cores memory disk estRunTime  
+            submit_time = parts[1]
+            job_id = parts[2]
+            cores = int(parts[3])
+            memory = int(parts[4])
+            disk = int(parts[5])
+            est_runtime = parts[6]
+            
+            print(f"JOBP received: job_id={job_id}, cores={cores}, memory={memory}, disk={disk}", file=sys.stderr)
+            
+            # Use first-fit scheduling for resubmitted jobs
+            scheduled = False
+            for server in servers:
+                if (server['cores'] >= cores and 
+                    server['memory'] >= memory and 
+                    server['disk'] >= disk):
+                    
+                    cmd = f"SCHD {job_id} {server['type']} {server['id']}\n"
+                    sock.sendall(cmd.encode())
+                    response = recv_line(sock)
+                    if response == "OK":
+                        print(f"Rescheduled job {job_id} to {server['type']} {server['id']}", file=sys.stderr)
+                        scheduled = True
+                        break
+            
+            if not scheduled:
+                print(f"Could not reschedule job {job_id}", file=sys.stderr)
+                sock.sendall(b"ENQJ GQ\n")
+                response = recv_line(sock)
+        
+        # ===== Handle other events =====
+        elif event.startswith("JCPL"):
+            # Job completion - we can ignore for basic scheduling
+            print(f"Job completed: {event}", file=sys.stderr)
+            
+        elif event.startswith("RESF"):
+            # Server failure - we can ignore for basic scheduling  
+            print(f"Server failed: {event}", file=sys.stderr)
+            
+        elif event.startswith("RESR"):
+            # Server recovery - we can ignore for basic scheduling
+            print(f"Server recovered: {event}", file=sys.stderr)
+            
+        elif event.startswith("CHKQ"):
+            # Check queue - no action needed for basic scheduling
+            print("Check queue event", file=sys.stderr)
+            
+        else:
+            print(f"Unknown event: {event}", file=sys.stderr)
 
-            server_type, server_id = best_server
-
-            # Send SCHD command TO SERVER (this is what was missing)
-            cmd = f"SCHD {job_id} {server_type} {server_id}\n"
-            sock.sendall(cmd.encode())
-            response = recv_line(sock)  # Expect "OK"
-
-            # Continue the loop
-            continue
-
-    # ===== Clean shutdown =====
+    # ===== PROTOCOL STEP 12-14: Clean shutdown =====
+    print("Sending QUIT", file=sys.stderr)
     sock.sendall(b"QUIT\n")
-    try:
-        _ = recv_line(sock)
-    except Exception:
-        pass
-
+    response = recv_line(sock)
     sock.close()
+    print("Simulation complete", file=sys.stderr)
 
 
 if __name__ == "__main__":
