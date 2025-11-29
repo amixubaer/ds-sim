@@ -127,7 +127,7 @@ def main():
             count = int(header.split()[1])
 
             # First OK
-            send(sock, "OK")
+            send(sock, "OK\n")
 
             # Read N server lines
             servers = []
@@ -141,7 +141,7 @@ def main():
                             break
 
             # Second OK
-            send(sock, "OK")
+            send(sock, "OK\n")
 
             # Wait for "."
             while True:
@@ -163,7 +163,7 @@ def main():
 
         # Protocol check handling
         elif msg.startswith("CHKQ"):
-            send(sock, "OK")
+            send(sock, "OK\n")
             receive(sock)
             send(sock, "QUIT")
             break
