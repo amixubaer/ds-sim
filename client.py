@@ -153,12 +153,12 @@ def main():
             selected = choose_server(servers, req_cores, req_mem, req_disk)
 
             if selected:
-                send(sock, f"SCHD {job_id} {selected['type']} {selected['id']}")
+                send(sock, f"SCHD {job_id} {selected['type']} {selected['id']}\n")
                 receive(sock)
             else:
                 # fallback: just take first server in list
                 f = servers[0]
-                send(sock, f"SCHD {job_id} {f['type']} {f['id']}")
+                send(sock, f"SCHD {job_id} {f['type']} {f['id']}\n")
                 receive(sock)
 
         # Protocol check handling
