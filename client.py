@@ -84,7 +84,6 @@ def main():
 
     # Server state storage
     server_state = {}
-    running_jobs = {}  # Track job -> server mapping for completion handling
 
     for _ in range(n_recs):
         line = recv_line(sock)
@@ -98,25 +97,10 @@ def main():
         mem = int(rec[5])
         disk = int(rec[6])
 
-        # Extract cost if available (may be in different positions)
-        cost = 1.0
-        for i, field in enumerate(rec):
-            try:
-                cost_val = float(field)
-                # Reasonable cost range check
-                if 0 <= cost_val <= 1000000:
-                    cost = cost_val
-                    break
-            except ValueError:
-                continue
-
         server_state[(s_type, s_id)] = {
             "cores": cores,
             "mem": mem,
             "disk": disk,
-            "cost": cost,
-            "current_load": 0.0,  # Current core utilization
-            "total_load": 0.0,    # Total core-time accumulated
         }
 
     # Finish GETS All sequence
@@ -136,99 +120,43 @@ def main():
 
         parts = event.split()
 
-        # Handle job completion
-        if event.startswith("JCPL"):
-            if len(parts) >= 5:
-                job_id = parts[2]
-                server_type = parts[3]
-                server_id = parts[4]
-                
-                # Reduce load on the server where job completed
-                server_key = (server_type, server_id)
-                if server_key in server_state and job_id in running_jobs:
-                    job_cores = running_jobs[job_id]["cores"]
-                    server_state[server_key]["current_load"] -= job_cores
-                    del running_jobs[job_id]
+        # Handle job completion and other events
+        if event.startswith(("JCPL", "RESF", "RESR", "CHKQ")):
             continue
 
-        # Handle server recovery/failure
-        if event.startswith(("RESF", "RESR")):
-            # Reset server state on failure/recovery
-            if len(parts) >= 4:
-                server_type = parts[1]
-                server_id = parts[2]
-                server_key = (server_type, server_id)
-                if server_key in server_state:
-                    server_state[server_key]["current_load"] = 0.0
-                    server_state[server_key]["total_load"] = 0.0
-            continue
-
-        # Handle queue check
-        if event.startswith("CHKQ"):
-            continue
-
-        # New or pre-empted job
+        # New or pre-empted job - THIS IS WHAT YOU RECEIVE FROM SERVER
         if event.startswith("JOBN") or event.startswith("JOBP"):
             if len(parts) < 7:
                 continue
 
-            # Correct field parsing
-            submit_time = int(parts[1])
-            job_id = parts[2]  # Fixed: job_id is at index 2
+            # Parse the job information FROM SERVER
+            job_id = parts[2]
             cores = int(parts[3])
             mem = int(parts[4])
             disk = int(parts[5])
-            est_runtime = int(parts[6])
 
-            # Find best server using load-balancing heuristic
+            # Find first capable server (simple algorithm)
             best_server = None
-            best_score = float('inf')
-
             for server_key, server in server_state.items():
-                # Check if server can handle the job
                 if (server["cores"] >= cores and 
                     server["mem"] >= mem and 
                     server["disk"] >= disk):
-                    
-                    # Calculate score: current load + cost factor
-                    current_load = server["current_load"]
-                    cost_factor = server["cost"] * 0.001
-                    
-                    # Score prioritizes less loaded servers, with cost as tie-breaker
-                    score = current_load + cost_factor
-                    
-                    if score < best_score:
-                        best_score = score
-                        best_server = server_key
-
-            # Fallback to first capable server if none found
-            if best_server is None:
-                for server_key, server in server_state.items():
-                    if (server["cores"] >= cores and 
-                        server["mem"] >= mem and 
-                        server["disk"] >= disk):
-                        best_server = server_key
-                        break
+                    best_server = server_key
+                    break
 
             if best_server is None:
-                # No capable server found - this shouldn't happen with GETS All
+                # No capable server found
                 continue
 
             server_type, server_id = best_server
 
-            # Send schedule command
+            # Send SCHD command TO SERVER (this is what was missing)
             cmd = f"SCHD {job_id} {server_type} {server_id}\n"
             sock.sendall(cmd.encode())
-            response = recv_line(sock)
+            response = recv_line(sock)  # Expect "OK"
 
-            if response == "OK":
-                # Update server load and track the job
-                server_state[best_server]["current_load"] += cores
-                server_state[best_server]["total_load"] += cores * est_runtime
-                running_jobs[job_id] = {
-                    "cores": cores,
-                    "server": best_server
-                }
+            # Continue the loop
+            continue
 
     # ===== Clean shutdown =====
     sock.sendall(b"QUIT\n")
