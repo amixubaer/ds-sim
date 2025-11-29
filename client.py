@@ -97,7 +97,7 @@ def main():
 
     # Main event loop
     while True:
-        send(sock, "REDY")
+        send(sock, "REDY\n")
         msg = receive(sock)
 
         if not msg:
