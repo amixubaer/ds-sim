@@ -6,14 +6,12 @@ HOST = "127.0.0.1"
 PORT = 50000
 USER = "ABC"
 
-def send(sock, msg: str) -> None:
-    """Send a message with guaranteed newline (protocol requirement)"""
+def send(sock, msg):
     if not msg.endswith('\n'):
         msg += '\n'
     sock.sendall(msg.encode())
 
-def recv_line(sock) -> str:
-    """Receive a single line (until newline)"""
+def recv_line(sock):
     data = b""
     while not data.endswith(b'\n'):
         chunk = sock.recv(1)
@@ -22,8 +20,7 @@ def recv_line(sock) -> str:
         data += chunk
     return data.decode().strip()
 
-def parse_server(line: str):
-    """Parse server record efficiently"""
+def parse_server(line):
     parts = line.split()
     try:
         return {
@@ -40,14 +37,6 @@ def parse_server(line: str):
         return None
 
 def choose_server_optimized(servers, need_c, need_m, need_d):
-    """
-    Optimized for turnaround time and cost:
-    1. Filter capable servers
-    2. Prefer servers with FEWER cores (better utilization, lower cost)
-    3. Fewer waiting jobs (reduces queue time)
-    4. Active state (avoids boot time)
-    5. More running jobs (indicates good utilization)
-    """
     eligible = []
     for s in servers:
         if s["cores"] >= need_c and s["memory"] >= need_m and s["disk"] >= need_d:
@@ -56,21 +45,18 @@ def choose_server_optimized(servers, need_c, need_m, need_d):
     if not eligible:
         return None
 
-    # State priority: active > idle > booting > inactive
     state_priority = {"active": 0, "idle": 1, "booting": 2, "inactive": 3}
     
-    # Sort by: state priority, cores (asc), waiting (asc), running (desc)
     eligible.sort(key=lambda s: (
-        state_priority.get(s["state"], 4),  # Prefer active servers
-        s["cores"],                         # Prefer smaller servers (better utilization)
-        s["waiting"],                       # Fewer waiting jobs
-        -s["running"]                       # More running jobs (good utilization)
+        state_priority.get(s["state"], 4),
+        s["cores"],
+        s["waiting"],
+        -s["running"]
     ))
     
     return eligible[0]
 
 def get_capable_servers(sock, cores, memory, disk):
-    """Optimized server query with proper protocol"""
     send(sock, f"GETS Capable {cores} {memory} {disk}\n")
     header = recv_line(sock)
     
@@ -89,7 +75,6 @@ def get_capable_servers(sock, cores, memory, disk):
     
     send(sock, "OK\n")
     
-    # Read until dot
     while recv_line(sock) != ".":
         pass
     
@@ -102,7 +87,7 @@ def main():
         print(f"Connection failed: {e}", file=sys.stderr)
         return
 
-    # Handshake with proper newlines
+    # Handshake
     send(sock, "HELO\n")
     if recv_line(sock) != "OK":
         sock.close()
@@ -113,7 +98,7 @@ def main():
         sock.close()
         return
 
-    print("Connected to ds-sim - Optimized Scheduler", file=sys.stderr)
+    print("Connected to ds-sim", file=sys.stderr)
 
     # Main event loop
     while True:
@@ -130,31 +115,43 @@ def main():
 
         parts = msg.split()
         
-        # Handle job scheduling
+        # Handle job scheduling 
         if parts[0] in ["JOBN", "JOBP"] and len(parts) >= 7:
-            job_id = parts[2]
+            submit_time = parts[1]
+            job_id = parts[2]  
             req_cores = int(parts[3])
             req_mem = int(parts[4])
             req_disk = int(parts[5])
 
-            print(f"Scheduling job {job_id}: {req_cores}c {req_mem}m {req_disk}d", file=sys.stderr)
+            print(f"Scheduling job {job_id} (submit time: {submit_time}): {req_cores}c {req_mem}m {req_disk}d", file=sys.stderr)
 
             servers = get_capable_servers(sock, req_cores, req_mem, req_disk)
             
             if servers:
                 selected = choose_server_optimized(servers, req_cores, req_mem, req_disk)
                 if selected:
-                    send(sock, f"SCHD {job_id} {selected['type']} {selected['id']}\n")
+                    cmd = f"SCHD {job_id} {selected['type']} {selected['id']}\n"
+                    print(f"Sending: {cmd.strip()}", file=sys.stderr)
+                    send(sock, cmd)
                     response = recv_line(sock)
+                    print(f"Response: {response}", file=sys.stderr)
                     if response != "OK":
-                        print(f"SCHD failed: {response}", file=sys.stderr)
+                        # If scheduling fails, try to enqueue the job
+                        print("Scheduling failed, trying to enqueue...", file=sys.stderr)
+                        send(sock, "ENQJ GQ\n")
+                        response = recv_line(sock)
+                        print(f"Enqueue response: {response}", file=sys.stderr)
                 else:
-                    # Fallback: use first capable server
+                    # Fallback
                     selected = servers[0]
-                    send(sock, f"SCHD {job_id} {selected['type']} {selected['id']}\n")
+                    cmd = f"SCHD {job_id} {selected['type']} {selected['id']}\n"
+                    print(f"Fallback scheduling: {cmd.strip()}", file=sys.stderr)
+                    send(sock, cmd)
                     recv_line(sock)
             else:
-                print("No capable servers found!", file=sys.stderr)
+                print("No capable servers found, trying to enqueue...", file=sys.stderr)
+                send(sock, "ENQJ GQ\n")
+                recv_line(sock)
 
         # Handle check queue
         elif parts[0] == "CHKQ":
@@ -166,7 +163,7 @@ def main():
 
         # Handle other events
         elif parts[0] in ["JCPL", "RESF", "RESR"]:
-            pass
+            print(f"Ignoring event: {msg}", file=sys.stderr)
 
     sock.close()
     print("Simulation complete", file=sys.stderr)
