@@ -105,7 +105,7 @@ def main():
 
         # Simulator finishes
         if msg == "NONE":
-            send(sock, "QUIT")
+            send(sock, "QUIT\n")
             receive(sock)
             break
 
