@@ -22,7 +22,7 @@ def recv_line(sock) -> str:
         data += chunk
     return data.decode().strip()
 
-def parse_server(line: str) -> dict:
+def parse_server(line: str):
     """Parse server record efficiently"""
     parts = line.split()
     try:
@@ -81,9 +81,10 @@ def get_capable_servers(sock, cores, memory, disk):
     send(sock, "OK\n")
     
     servers = []
-    for _ in range(count):
+    for i in range(count):
         line = recv_line(sock)
-        if server := parse_server(line):
+        server = parse_server(line)
+        if server:
             servers.append(server)
     
     send(sock, "OK\n")
