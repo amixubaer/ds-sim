@@ -100,6 +100,9 @@ def main():
 
     print("Connected to ds-sim", file=sys.stderr)
 
+    # Track current job to avoid loops
+    current_job_id = None
+    
     # Main event loop
     while True:
         send(sock, "REDY\n")
@@ -115,15 +118,16 @@ def main():
 
         parts = msg.split()
         
-        # Handle job scheduling 
-        if parts[0] in ["JOBN", "JOBP"] and len(parts) >= 7:
+        # Handle NEW job (first submission)
+        if parts[0] == "JOBN" and len(parts) >= 7:
             submit_time = parts[1]
-            job_id = parts[2]  
+            job_id = parts[2]
             req_cores = int(parts[3])
             req_mem = int(parts[4])
             req_disk = int(parts[5])
 
-            print(f"Scheduling job {job_id} (submit time: {submit_time}): {req_cores}c {req_mem}m {req_disk}d", file=sys.stderr)
+            print(f"NEW JOB {job_id}: {req_cores}c {req_mem}m {req_disk}d", file=sys.stderr)
+            current_job_id = job_id
 
             servers = get_capable_servers(sock, req_cores, req_mem, req_disk)
             
@@ -131,27 +135,38 @@ def main():
                 selected = choose_server_optimized(servers, req_cores, req_mem, req_disk)
                 if selected:
                     cmd = f"SCHD {job_id} {selected['type']} {selected['id']}\n"
-                    print(f"Sending: {cmd.strip()}", file=sys.stderr)
+                    print(f"Scheduling: {cmd.strip()}", file=sys.stderr)
                     send(sock, cmd)
                     response = recv_line(sock)
                     print(f"Response: {response}", file=sys.stderr)
-                    if response != "OK":
-                        # If scheduling fails, try to enqueue the job
-                        print("Scheduling failed, trying to enqueue...", file=sys.stderr)
-                        send(sock, "ENQJ GQ\n")
-                        response = recv_line(sock)
-                        print(f"Enqueue response: {response}", file=sys.stderr)
                 else:
-                    # Fallback
                     selected = servers[0]
                     cmd = f"SCHD {job_id} {selected['type']} {selected['id']}\n"
-                    print(f"Fallback scheduling: {cmd.strip()}", file=sys.stderr)
+                    print(f"Fallback: {cmd.strip()}", file=sys.stderr)
                     send(sock, cmd)
                     recv_line(sock)
-            else:
-                print("No capable servers found, trying to enqueue...", file=sys.stderr)
-                send(sock, "ENQJ GQ\n")
-                recv_line(sock)
+        
+        # Handle RESUBMITTED job (failed/killed job)
+        elif parts[0] == "JOBP" and len(parts) >= 7:
+            submit_time = parts[1]
+            job_id = parts[2]
+            req_cores = int(parts[3])
+            req_mem = int(parts[4])
+            req_disk = int(parts[5])
+
+            print(f"RESUBMITTED JOB {job_id}: {req_cores}c {req_mem}m {req_disk}d", file=sys.stderr)
+            
+            # For resubmitted jobs, use a simpler first-fit approach
+            servers = get_capable_servers(sock, req_cores, req_mem, req_disk)
+            
+            if servers:
+                # Just pick the first capable server for resubmitted jobs
+                selected = servers[0]
+                cmd = f"SCHD {job_id} {selected['type']} {selected['id']}\n"
+                print(f"Rescheduling: {cmd.strip()}", file=sys.stderr)
+                send(sock, cmd)
+                response = recv_line(sock)
+                print(f"Response: {response}", file=sys.stderr)
 
         # Handle check queue
         elif parts[0] == "CHKQ":
@@ -163,7 +178,7 @@ def main():
 
         # Handle other events
         elif parts[0] in ["JCPL", "RESF", "RESR"]:
-            print(f"Ignoring event: {msg}", file=sys.stderr)
+            print(f"Event: {msg}", file=sys.stderr)
 
     sock.close()
     print("Simulation complete", file=sys.stderr)
