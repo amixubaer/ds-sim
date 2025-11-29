@@ -5,9 +5,6 @@ import sys
 import argparse
 
 
-# -------------------------
-# I/O helpers
-# -------------------------
 def recv_line(sock):
     """Receive a single newline-terminated line from the socket."""
     data = b""
@@ -19,221 +16,228 @@ def recv_line(sock):
     return data.decode().strip()
 
 
-def send_line(sock, msg: str):
-    sock.sendall((msg + "\n").encode())
-
-
-# -------------------------
-# ds-sim helpers
-# -------------------------
-def parse_server(line):
-    """
-    Server record format (MQ ds-server):
-    type id state curStartTime cores mem disk wJobs rJobs
-    """
-    p = line.split()
-    return {
-        "type": p[0],
-        "id": int(p[1]),
-        "state": p[2],
-        "start": int(p[3]),
-        "cores": int(p[4]),
-        "mem": int(p[5]),
-        "disk": int(p[6]),
-        "wJobs": int(p[7]) if len(p) > 7 else 0,
-        "rJobs": int(p[8]) if len(p) > 8 else 0,
-    }
-
-
-def gets(sock, cmd):
-    """Send GETS command and parse returned server list."""
-    send_line(sock, cmd)
-    header = recv_line(sock)
-
-    if not header.startswith("DATA"):
-        return []
-
-    n = int(header.split()[1])
-    send_line(sock, "OK")
-
-    servers = []
-    for _ in range(n):
-        line = recv_line(sock)
-        if line:
-            servers.append(parse_server(line))
-
-    send_line(sock, "OK")
-    _ = recv_line(sock)  # final "."
-    return servers
-
-
-def state_priority(state: str) -> int:
-    """
-    Prefer servers already on:
-      idle < active < booting < inactive
-    """
-    if state == "idle":
-        return 0
-    if state == "active":
-        return 1
-    if state == "booting":
-        return 2
-    if state == "inactive":
-        return 3
-    return 4
-
-
-def best_fit(servers, cores, mem, disk):
-    """Best-fit to reduce waste (fast tie-break)."""
-    return min(
-        servers,
-        key=lambda s: (
-            s["cores"] - cores,
-            s["mem"] - mem,
-            s["disk"] - disk,
-            state_priority(s["state"]),
-            s["type"],
-            s["id"],
-        ),
-    )
-
-
-def choose_fast_ect(servers, est_runtime, cores, mem, disk):
-    """
-    Fast ECT heuristic:
-    - uses wJobs/rJobs as queue proxy
-    - prefers idle/active servers
-    - best-fit as tie-break
-    """
-    def score(s):
-        w = s["wJobs"]
-        r = s["rJobs"]
-
-        # queue-aware estimated completion proxy
-        ect = est_runtime * (1 + w + 0.5 * r)
-
-        # avoid booting/inactive unless needed
-        st_pen = state_priority(s["state"]) * est_runtime * 2
-
-        # mild best-fit penalty
-        leftover = s["cores"] - cores
-        fit_pen = leftover * 0.1 * est_runtime
-
-        return (
-            ect + st_pen + fit_pen,
-            state_priority(s["state"]),
-            leftover,
-            s["type"],
-            s["id"],
-        )
-
-    return min(servers, key=score)
-
-
-# -------------------------
-# Main
-# -------------------------
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--algo", required=True, help="Sent in AUTH (keep as in your working code).")
-    parser.add_argument("-p", "--port", type=int, default=50000)
+    parser.add_argument(
+        "--algo",
+        required=True,
+        help="Scheduling algorithm name (sent in AUTH).",
+    )
+    parser.add_argument(
+        "-p",
+        "--port",
+        type=int,
+        default=50000,
+        help="Port ds-server is listening on (default 50000).",
+    )
     args = parser.parse_args()
 
-    # ----- Connect -----
+    # ===== Connect to server =====
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.connect(("localhost", args.port))
 
-    # optional greeting
+    # Handle initial message if present
     sock.settimeout(0.2)
     try:
         _ = recv_line(sock)
-    except Exception:
+    except (socket.timeout, OSError):
         pass
-    sock.settimeout(None)
+    finally:
+        sock.settimeout(None)
 
-    # ----- Handshake (same as your working version) -----
-    send_line(sock, "HELO")
+    # ===== Handshake =====
+    sock.sendall(b"HELO\n")
     resp1 = recv_line(sock)
 
-    send_line(sock, f"AUTH {args.algo}")
+    sock.sendall(f"AUTH {args.algo}\n".encode())
     resp2 = recv_line(sock)
 
     if resp1 != "OK" or resp2 != "OK":
+        sock.sendall(b"QUIT\n")
         try:
-            send_line(sock, "QUIT")
             recv_line(sock)
         except Exception:
             pass
         sock.close()
         sys.exit(1)
 
-    # Cache static list once (for bounds + fallback)
-    all_servers = gets(sock, "GETS All")
-    if not all_servers:
-        send_line(sock, "QUIT")
+    print(">>> HANDSHAKE SUCCESSFUL <<<", file=sys.stderr)
+
+    # ===== GETS All: get static server list =====
+    sock.sendall(b"GETS All\n")
+    data_resp = recv_line(sock)
+
+    parts = data_resp.split()
+    if len(parts) < 3 or not data_resp.startswith("DATA"):
+        sock.sendall(b"QUIT\n")
+        try:
+            recv_line(sock)
+        except Exception:
+            pass
         sock.close()
         sys.exit(1)
 
-    # ----- Scheduling loop -----
+    n_recs = int(parts[1])
+
+    # Acknowledge DATA
+    sock.sendall(b"OK\n")
+
+    # Server state storage
+    server_state = {}
+    running_jobs = {}  # Track job -> server mapping for completion handling
+
+    for _ in range(n_recs):
+        line = recv_line(sock)
+        rec = line.split()
+        if len(rec) < 7:
+            continue
+            
+        s_type = rec[0]
+        s_id = rec[1]
+        cores = int(rec[4])
+        mem = int(rec[5])
+        disk = int(rec[6])
+
+        # Extract cost if available (may be in different positions)
+        cost = 1.0
+        for i, field in enumerate(rec):
+            try:
+                cost_val = float(field)
+                # Reasonable cost range check
+                if 0 <= cost_val <= 1000000:
+                    cost = cost_val
+                    break
+            except ValueError:
+                continue
+
+        server_state[(s_type, s_id)] = {
+            "cores": cores,
+            "mem": mem,
+            "disk": disk,
+            "cost": cost,
+            "current_load": 0.0,  # Current core utilization
+            "total_load": 0.0,    # Total core-time accumulated
+        }
+
+    # Finish GETS All sequence
+    sock.sendall(b"OK\n")
+    _ = recv_line(sock)  # final "."
+
+    # ===== Main scheduling loop =====
     while True:
-        send_line(sock, "REDY")
+        sock.sendall(b"REDY\n")
         event = recv_line(sock)
 
-        if not event or event == "NONE":
+        if not event:
             break
 
-        if event.startswith(("JCPL", "RESF", "RESR", "CHKQ")):
+        if event == "NONE":
+            break
+
+        parts = event.split()
+
+        # Handle job completion
+        if event.startswith("JCPL"):
+            if len(parts) >= 5:
+                job_id = parts[2]
+                server_type = parts[3]
+                server_id = parts[4]
+                
+                # Reduce load on the server where job completed
+                server_key = (server_type, server_id)
+                if server_key in server_state and job_id in running_jobs:
+                    job_cores = running_jobs[job_id]["cores"]
+                    server_state[server_key]["current_load"] -= job_cores
+                    del running_jobs[job_id]
             continue
 
-        if event.startswith(("JOBN", "JOBP")):
-            parts = event.split()
+        # Handle server recovery/failure
+        if event.startswith(("RESF", "RESR")):
+            # Reset server state on failure/recovery
+            if len(parts) >= 4:
+                server_type = parts[1]
+                server_id = parts[2]
+                server_key = (server_type, server_id)
+                if server_key in server_state:
+                    server_state[server_key]["current_load"] = 0.0
+                    server_state[server_key]["total_load"] = 0.0
+            continue
+
+        # Handle queue check
+        if event.startswith("CHKQ"):
+            continue
+
+        # New or pre-empted job
+        if event.startswith("JOBN") or event.startswith("JOBP"):
             if len(parts) < 7:
                 continue
 
-            # Your confirmed MQ format:
-            # JOBN submitTime jobID cores mem disk estRuntime
-            submit_time = int(parts[1])       # not used, but correct
-            job_id_a = int(parts[2])          # standard MQ jobID
-            job_id_b = int(parts[1])          # fallback only if server complains
+            # Correct field parsing
+            submit_time = int(parts[1])
+            job_id = parts[2]  # Fixed: job_id is at index 2
             cores = int(parts[3])
             mem = int(parts[4])
             disk = int(parts[5])
             est_runtime = int(parts[6])
 
-            # 1) Avail-first (fastest turnaround)
-            avail = gets(sock, f"GETS Avail {cores} {mem} {disk}")
-            if avail:
-                chosen = best_fit(avail, cores, mem, disk)
-            else:
-                capable = gets(sock, f"GETS Capable {cores} {mem} {disk}")
-                if capable:
-                    chosen = choose_fast_ect(capable, est_runtime, cores, mem, disk)
-                else:
-                    chosen = best_fit(all_servers, cores, mem, disk)
+            # Find best server using load-balancing heuristic
+            best_server = None
+            best_score = float('inf')
 
-            # Send SCHD, check reply
-            def schd(jid):
-                send_line(sock, f"SCHD {jid} {chosen['type']} {chosen['id']}")
-                return recv_line(sock)
+            for server_key, server in server_state.items():
+                # Check if server can handle the job
+                if (server["cores"] >= cores and 
+                    server["mem"] >= mem and 
+                    server["disk"] >= disk):
+                    
+                    # Calculate score: current load + cost factor
+                    current_load = server["current_load"]
+                    cost_factor = server["cost"] * 0.001
+                    
+                    # Score prioritizes less loaded servers, with cost as tie-breaker
+                    score = current_load + cost_factor
+                    
+                    if score < best_score:
+                        best_score = score
+                        best_server = server_key
 
-            reply = schd(job_id_a)
+            # Fallback to first capable server if none found
+            if best_server is None:
+                for server_key, server in server_state.items():
+                    if (server["cores"] >= cores and 
+                        server["mem"] >= mem and 
+                        server["disk"] >= disk):
+                        best_server = server_key
+                        break
 
-            # Rare safety: if jobID position mismatch, retry once
-            if "No such waiting job exists" in reply:
-                reply2 = schd(job_id_b)
-                # if still not OK, just continue and server will resend
-                if reply2 != "OK":
-                    continue
+            if best_server is None:
+                # No capable server found - this shouldn't happen with GETS All
+                continue
 
-    # ----- Clean shutdown -----
+            server_type, server_id = best_server
+
+            # Send schedule command
+            cmd = f"SCHD {job_id} {server_type} {server_id}\n"
+            sock.sendall(cmd.encode())
+            response = recv_line(sock)
+
+            if response == "OK":
+                # Update server load and track the job
+                server_state[best_server]["current_load"] += cores
+                server_state[best_server]["total_load"] += cores * est_runtime
+                running_jobs[job_id] = {
+                    "cores": cores,
+                    "server": best_server
+                }
+
+    # ===== Clean shutdown =====
+    sock.sendall(b"QUIT\n")
     try:
-        send_line(sock, "QUIT")
-        recv_line(sock)
+        _ = recv_line(sock)
     except Exception:
         pass
 
     sock.close()
-    sys.exit(0)
 
 
 if __name__ == "__main__":
