@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import socket
 
 HOST = "127.0.0.1"
@@ -8,38 +9,63 @@ USER = "ABC"
 # Basic network helpers
 # ---------------------------------------------------------
 
-def send(sock, msg):
+def send(sock, msg: str) -> None:
+    """Send a message (string) to the server."""
     sock.sendall(msg.encode("ascii"))
 
-def receive(sock, timeout=2):
+
+def receive(sock, timeout: float = 2.0) -> str:
+    """
+    Receive up to 8192 bytes, with a timeout.
+    Returns a stripped ASCII string (may contain embedded newlines).
+    """
     sock.settimeout(timeout)
     try:
         data = sock.recv(8192)
         if not data:
             return ""
         return data.decode("ascii", errors="ignore").strip()
-    except:
+    except Exception:
         return ""
 
 
 # ---------------------------------------------------------
-# TFPS Server Selection Logic
+# Server parsing & selection
 # ---------------------------------------------------------
 
-def parse_server(line):
+def parse_server(line: str) -> dict:
+    """
+    Parse one server record line from GETS Capable.
+
+    Expected format (assignment 2 variant):
+      type id state curStartTime cores memory disk wJobs rJobs [cost ...]
+
+    We only use a subset of fields plus wJobs.
+    """
     parts = line.split()
     return {
-        "type": parts[0],
-        "id": int(parts[1]),
-        "state": parts[2],
-        "cores": int(parts[4]),
+        "type":   parts[0],
+        "id":     int(parts[1]),
+        "state":  parts[2],
+        "cores":  int(parts[4]),
         "memory": int(parts[5]),
-        "disk": int(parts[6]),
-        "waiting": int(parts[7])
+        "disk":   int(parts[6]),
+        "waiting": int(parts[7]),
     }
 
+
 def choose_server(servers, need_c, need_m, need_d):
-    # 1. Filter servers that can run the job
+    """
+    Heuristic to improve turnaround time:
+
+    1. Filter to servers that can run this job (cores/mem/disk).
+    2. Among capable servers, prefer:
+          - MORE cores (to finish jobs faster),
+          - FEWER waiting jobs (to avoid long queues),
+          - MORE memory as a gentle tie-breaker,
+          - LOWER id as final tie-breaker (stable choice).
+    """
+    # 1. Filter capable servers
     eligible = []
     for s in servers:
         if s["cores"] >= need_c and s["memory"] >= need_m and s["disk"] >= need_d:
@@ -48,42 +74,31 @@ def choose_server(servers, need_c, need_m, need_d):
     if not eligible:
         return None
 
-    # 2. Compute core gap
-    for s in eligible:
-        s["coreGap"] = s["cores"] - need_c
+    # 2. Sort by our heuristic:
+    #    - largest cores first  -> -cores
+    #    - least waiting jobs   -> waiting
+    #    - most memory          -> -memory
+    #    - smaller id           -> id
+    eligible.sort(
+        key=lambda s: (-s["cores"], s["waiting"], -s["memory"], s["id"])
+    )
 
-    # 3. Keep only those with smallest core gap
-    eligible.sort(key=lambda x: x["coreGap"])
-    best_gap = eligible[0]["coreGap"]
-    gap_group = [s for s in eligible if s["coreGap"] == best_gap]
-
-    # 4. Keep servers with highest memory in this group
-    gap_group.sort(key=lambda x: x["memory"], reverse=True)
-    max_mem = gap_group[0]["memory"]
-    mem_group = [s for s in gap_group if s["memory"] == max_mem]
-
-    # 5. Prioritise states: active > idle > booting > inactive
-    state_priority = {"active": 0, "idle": 1, "booting": 2, "inactive": 3}
-    mem_group.sort(key=lambda x: state_priority.get(x["state"], 99))
-
-    # 6. If still tied → pick fewest waiting jobs
-    mem_group.sort(key=lambda x: x["waiting"])
-
-    # Best server is now mem_group[0]
-    return mem_group[0]
+    # Best server is the first one after sorting
+    return eligible[0]
 
 
 # ---------------------------------------------------------
-# Main DS-Sim Client Logic (with TFPS)
+# Main DS-Sim Client Logic
 # ---------------------------------------------------------
 
 def main():
+    # Connect to ds-server
     try:
         sock = socket.create_connection((HOST, PORT), timeout=1)
-    except:
+    except Exception:
         return
 
-    # Handshake
+    # ===== Handshake =====
     send(sock, "HELO\n")
     if receive(sock) != "OK":
         sock.close()
@@ -94,7 +109,7 @@ def main():
         sock.close()
         return
 
-    # Main event loop
+    # ===== Main event loop =====
     while True:
         send(sock, "REDY\n")
         msg = receive(sock)
@@ -102,7 +117,7 @@ def main():
         if not msg:
             break
 
-        # Simulator finishes
+        # Simulator is done
         if msg == "NONE":
             send(sock, "QUIT\n")
             receive(sock)
@@ -111,56 +126,65 @@ def main():
         # Normal job event
         if msg.startswith("JOBN") or msg.startswith("JOBP"):
             parts = msg.split()
+
+
             job_id = parts[1]
             req_cores = int(parts[3])
             req_mem = int(parts[4])
             req_disk = int(parts[5])
+            # est_runtime = int(parts[6])  # available but not strictly needed here
 
-            # Request capable servers
+            # ---- Query capable servers ----
             send(sock, f"GETS Capable {req_cores} {req_mem} {req_disk}\n")
             header = receive(sock)
 
             if not header.startswith("DATA"):
+                # If something weird happens, just continue to next REDY
                 continue
 
             count = int(header.split()[1])
 
-            # First OK
+            # 1st OK to start receiving records
             send(sock, "OK\n")
 
-            # Read N server lines
             servers = []
             while len(servers) < count:
                 chunk = receive(sock)
+                if not chunk:
+                    break
                 for line in chunk.split("\n"):
                     line = line.strip()
-                    if line:
-                        servers.append(parse_server(line))
-                        if len(servers) == count:
-                            break
+                    if not line:
+                        continue
+                    servers.append(parse_server(line))
+                    if len(servers) == count:
+                        break
 
-            # Second OK
+            # 2nd OK to signal we are done reading
             send(sock, "OK\n")
 
-            # Wait for "."
+            # Read until we see "."
             while True:
                 endmsg = receive(sock)
                 if "." in endmsg:
                     break
+                if not endmsg:
+                    break
 
-            # Choose server with TFPS
+            # ---- Choose server using improved heuristic ----
             selected = choose_server(servers, req_cores, req_mem, req_disk)
 
-            if selected:
-                send(sock, f"SCHD {job_id} {selected['type']} {selected['id']}\n")
-                receive(sock)
-            else:
-                # fallback: just take first server in list
-                f = servers[0]
-                send(sock, f"SCHD {job_id} {f['type']} {f['id']}\n")
-                receive(sock)
+            if selected is None:
+                # Fallback: schedule on the first server if for some reason none were eligible
+                selected = servers[0]
 
-        # Protocol check handling
+            send(
+                sock,
+                f"SCHD {job_id} {selected['type']} {selected['id']}\n"
+            )
+            receive(sock)  # expect "OK"
+
+        # ds-server sometimes sends CHKQ for protocol checking
         elif msg.startswith("CHKQ"):
             send(sock, "OK\n")
             receive(sock)
