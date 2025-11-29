@@ -165,7 +165,7 @@ def main():
         elif msg.startswith("CHKQ"):
             send(sock, "OK\n")
             receive(sock)
-            send(sock, "QUIT")
+            send(sock, "QUIT\n")
             break
 
     sock.close()
