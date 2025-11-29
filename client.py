@@ -118,7 +118,7 @@ def main():
             req_disk = int(parts[5])
 
             # Request capable servers
-            send(sock, f"GETS Capable {req_cores} {req_mem} {req_disk}")
+            send(sock, f"GETS Capable {req_cores} {req_mem} {req_disk}\n")
             header = receive(sock)
 
             if not header.startswith("DATA"):
