@@ -90,7 +90,7 @@ def main():
         sock.close()
         return
 
-    send(sock, f"AUTH {USER}")
+    send(sock, f"AUTH {USER}\n")
     if receive(sock) != "OK":
         sock.close()
         return
