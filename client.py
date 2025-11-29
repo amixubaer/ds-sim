@@ -23,7 +23,7 @@ def receive(sock, timeout=2):
 
 
 # ---------------------------------------------------------
-# TFPS Server Selection Logic (your original, kept)
+# TFPS Server Selection Logic
 # ---------------------------------------------------------
 
 def parse_server(line):
@@ -74,52 +74,7 @@ def choose_server(servers, need_c, need_m, need_d):
 
 
 # ---------------------------------------------------------
-# Helper: GETS sequence (exactly same pattern as your working code)
-# ---------------------------------------------------------
-
-def gets_servers(sock, cmd, req_cores, req_mem, req_disk):
-    """
-    Run a GETS command (Avail or Capable) using your original
-    working handshake pattern.
-    """
-    send(sock, f"{cmd} {req_cores} {req_mem} {req_disk}\n")
-    header = receive(sock)
-
-    if not header.startswith("DATA"):
-        return []
-
-    count = int(header.split()[1])
-
-    # First OK
-    send(sock, "OK\n")
-
-    # Read N server lines
-    servers = []
-    while len(servers) < count:
-        chunk = receive(sock)
-        if not chunk:
-            continue
-        for line in chunk.split("\n"):
-            line = line.strip()
-            if line:
-                servers.append(parse_server(line))
-                if len(servers) == count:
-                    break
-
-    # Second OK
-    send(sock, "OK\n")
-
-    # Wait for "."
-    while True:
-        endmsg = receive(sock)
-        if "." in endmsg:
-            break
-
-    return servers
-
-
-# ---------------------------------------------------------
-# Main DS-Sim Client Logic (TFPS + Avail-first)
+# Main DS-Sim Client Logic (with TFPS)
 # ---------------------------------------------------------
 
 def main():
@@ -128,7 +83,7 @@ def main():
     except:
         return
 
-    # Handshake (unchanged)
+    # Handshake
     send(sock, "HELO\n")
     if receive(sock) != "OK":
         sock.close()
@@ -156,22 +111,42 @@ def main():
         # Normal job event
         if msg.startswith("JOBN") or msg.startswith("JOBP"):
             parts = msg.split()
-            # Keep this EXACTLY like your working client
             job_id = parts[1]
             req_cores = int(parts[3])
             req_mem = int(parts[4])
             req_disk = int(parts[5])
 
-            # 1) Try GETS Avail first (new optimisation)
-            servers = gets_servers(sock, "GETS Avail", req_cores, req_mem, req_disk)
+            # Request capable servers
+            send(sock, f"GETS Capable {req_cores} {req_mem} {req_disk}\n")
+            header = receive(sock)
 
-            # 2) If no immediately available server, fallback to GETS Capable (your original logic)
-            if not servers:
-                servers = gets_servers(sock, "GETS Capable", req_cores, req_mem, req_disk)
-
-            if not servers:
-                # Should almost never happen; just skip
+            if not header.startswith("DATA"):
                 continue
+
+            count = int(header.split()[1])
+
+            # First OK
+            send(sock, "OK\n")
+
+            # Read N server lines
+            servers = []
+            while len(servers) < count:
+                chunk = receive(sock)
+                for line in chunk.split("\n"):
+                    line = line.strip()
+                    if line:
+                        servers.append(parse_server(line))
+                        if len(servers) == count:
+                            break
+
+            # Second OK
+            send(sock, "OK\n")
+
+            # Wait for "."
+            while True:
+                endmsg = receive(sock)
+                if "." in endmsg:
+                    break
 
             # Choose server with TFPS
             selected = choose_server(servers, req_cores, req_mem, req_disk)
