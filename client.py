@@ -6,10 +6,6 @@ PORT = 50000
 USER = "ABC"
 
 
-# ---------------------------------------------------------
-# Basic helpers
-# ---------------------------------------------------------
-
 def send(sock, msg: str) -> None:
     """Send a line (with newline) to the server."""
     sock.sendall((msg + "\n").encode())
@@ -34,38 +30,62 @@ def parse_server(line: str) -> dict:
     """
     Parse a server record line from GETS Capable / GETS All.
 
-    Expected format (per ds-sim brief variant):
-      type id state curStartTime cores mem disk wJobs rJobs rate relTime
+    Generic format (this variant):
+      type id state curStartTime cores mem disk wJobs [rJobs] [cost_or_rate ...]
 
-    We use: type, id, state, cores, mem, disk, wJobs, rJobs.
+    We will **only rely** on:
+      - type, id, state, cores, mem, disk, wJobs
+    and interpret an extra numeric field (if present) as a
+    'speed indicator' (e.g. cost or rate).
     """
     parts = line.split()
+
+    # Safe defaults
+    s_type = parts[0]
+    s_id = int(parts[1])
+    state = parts[2].lower()
+    cores = int(parts[4])
+    mem = int(parts[5])
+    disk = int(parts[6])
+    waiting = int(parts[7]) if len(parts) > 7 else 0
+
+    # Try to grab a "cost/rate" numeric value if present
+    speed_metric = 1.0
+    for p in parts[8:]:
+        try:
+            speed_metric = float(p)
+            break
+        except ValueError:
+            continue
+
     return {
-        "type": parts[0],
-        "id": int(parts[1]),
-        "state": parts[2].lower(),
-        "cores": int(parts[4]),
-        "memory": int(parts[5]),
-        "disk": int(parts[6]),
-        "waiting": int(parts[7]),
-        "running": int(parts[8]) if len(parts) > 8 else 0,
+        "type": s_type,
+        "id": s_id,
+        "state": state,
+        "cores": cores,
+        "memory": mem,
+        "disk": disk,
+        "waiting": waiting,
+        "speed_metric": speed_metric,
     }
 
 
-def choose_server(servers, need_c, need_m, need_d, est_runtime):
+def choose_server(servers, need_c, need_m, need_d):
     """
     Turnaround-focused heuristic:
 
-    1. Filter servers that can run the job (capacity).
-    2. Among eligible servers, minimise total queue length (waiting+running).
-    3. Tie-break by:
-         - better state (active < idle < booting < inactive)
-         - more cores
-         - more memory
-         - smaller id
+    1. Filter by capacity (cores, memory, disk).
+    2. Among eligible servers:
+         - minimise queue length (waiting jobs)
+         - prefer "faster" servers (higher speed_metric)
+         - prefer more cores
+         - prefer more memory
+         - prefer smaller id (stable tie-break)
+
+    state is used lightly to prefer active/idle over booting/inactive.
     """
 
-    # 1. Capacity filter
+    # Capacity filter
     eligible = []
     for s in servers:
         if s["cores"] >= need_c and s["memory"] >= need_m and s["disk"] >= need_d:
@@ -74,7 +94,7 @@ def choose_server(servers, need_c, need_m, need_d, est_runtime):
     if not eligible:
         return None
 
-    # 2. State ranking (better -> smaller number)
+    # State priority: better state gets smaller number
     state_rank = {
         "active": 0,
         "idle": 1,
@@ -82,15 +102,18 @@ def choose_server(servers, need_c, need_m, need_d, est_runtime):
         "inactive": 3,
     }
 
-    # 3. Sort by queue length etc.
     def key(s):
-        queue = s["waiting"] + s["running"]
+        # Smaller queue better
+        queue_len = s["waiting"]
+        speed = s["speed_metric"]
+
         return (
-            queue,                              # smaller queue first
-            state_rank.get(s["state"], 4),      # better state
-            -s["cores"],                        # more cores
-            -s["memory"],                       # more memory
-            s["id"],                            # smaller id
+            queue_len,                        # 1) fewer waiting jobs
+            -speed,                           # 2) faster server (bigger metric)
+            state_rank.get(s["state"], 4),    # 3) active/idle preferred
+            -s["cores"],                      # 4) more cores
+            -s["memory"],                     # 5) more memory
+            s["id"],                          # 6) stable tie-break
         )
 
     return min(eligible, key=key)
@@ -121,7 +144,7 @@ def main():
 
         if msg == "NONE":
             send(sock, "QUIT")
-            recv_line(sock)  # final "QUIT" response
+            recv_line(sock)  # final response
             break
 
         if msg.startswith("JOBN") or msg.startswith("JOBP"):
@@ -132,7 +155,7 @@ def main():
             req_cores = int(parts[3])
             req_mem = int(parts[4])
             req_disk = int(parts[5])
-            est_runtime = int(parts[6])
+            # est_runtime = int(parts[6])  # not used directly here, but available
 
             # Request capable servers
             send(sock, f"GETS Capable {req_cores} {req_mem} {req_disk}")
@@ -159,17 +182,17 @@ def main():
             while recv_line(sock) != ".":
                 pass
 
-            # Choose server with turnaround-focused heuristic
-            selected = choose_server(servers, req_cores, req_mem, req_disk, est_runtime)
+            # Choose server using aggressive TT heuristic
+            selected = choose_server(servers, req_cores, req_mem, req_disk)
             if selected is None:
-                # Fallback: just use first server
+                # Fallback: first capable
                 selected = servers[0]
 
             send(sock, f"SCHD {job_id} {selected['type']} {selected['id']}")
             _ = recv_line(sock)  # expect "OK"
 
         elif msg.startswith("CHKQ"):
-            # Protocol-check event – respond and quit
+            # Protocol check event – respond and quit cleanly
             send(sock, "OK")
             _ = recv_line(sock)
             send(sock, "QUIT")
