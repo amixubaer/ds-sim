@@ -7,7 +7,7 @@ USER = "ABC"
 
 
 def send(sock, msg: str) -> None:
-    """Send a line (with newline) to the server."""
+    """Send a single line (with newline) to the server."""
     sock.sendall((msg + "\n").encode())
 
 
@@ -22,107 +22,6 @@ def recv_line(sock) -> str:
     return data.decode().strip()
 
 
-# ---------------------------------------------------------
-# Server parsing & selection
-# ---------------------------------------------------------
-
-def parse_server(line: str) -> dict:
-    """
-    Parse a server record line from GETS Capable / GETS All.
-
-    Generic format (this variant):
-      type id state curStartTime cores mem disk wJobs [rJobs] [cost_or_rate ...]
-
-    We will **only rely** on:
-      - type, id, state, cores, mem, disk, wJobs
-    and interpret an extra numeric field (if present) as a
-    'speed indicator' (e.g. cost or rate).
-    """
-    parts = line.split()
-
-    # Safe defaults
-    s_type = parts[0]
-    s_id = int(parts[1])
-    state = parts[2].lower()
-    cores = int(parts[4])
-    mem = int(parts[5])
-    disk = int(parts[6])
-    waiting = int(parts[7]) if len(parts) > 7 else 0
-
-    # Try to grab a "cost/rate" numeric value if present
-    speed_metric = 1.0
-    for p in parts[8:]:
-        try:
-            speed_metric = float(p)
-            break
-        except ValueError:
-            continue
-
-    return {
-        "type": s_type,
-        "id": s_id,
-        "state": state,
-        "cores": cores,
-        "memory": mem,
-        "disk": disk,
-        "waiting": waiting,
-        "speed_metric": speed_metric,
-    }
-
-
-def choose_server(servers, need_c, need_m, need_d):
-    """
-    Turnaround-focused heuristic:
-
-    1. Filter by capacity (cores, memory, disk).
-    2. Among eligible servers:
-         - minimise queue length (waiting jobs)
-         - prefer "faster" servers (higher speed_metric)
-         - prefer more cores
-         - prefer more memory
-         - prefer smaller id (stable tie-break)
-
-    state is used lightly to prefer active/idle over booting/inactive.
-    """
-
-    # Capacity filter
-    eligible = []
-    for s in servers:
-        if s["cores"] >= need_c and s["memory"] >= need_m and s["disk"] >= need_d:
-            eligible.append(s)
-
-    if not eligible:
-        return None
-
-    # State priority: better state gets smaller number
-    state_rank = {
-        "active": 0,
-        "idle": 1,
-        "booting": 2,
-        "inactive": 3,
-    }
-
-    def key(s):
-        # Smaller queue better
-        queue_len = s["waiting"]
-        speed = s["speed_metric"]
-
-        return (
-            queue_len,                        # 1) fewer waiting jobs
-            -speed,                           # 2) faster server (bigger metric)
-            state_rank.get(s["state"], 4),    # 3) active/idle preferred
-            -s["cores"],                      # 4) more cores
-            -s["memory"],                     # 5) more memory
-            s["id"],                          # 6) stable tie-break
-        )
-
-    return min(eligible, key=key)
-
-
-# ---------------------------------------------------------
-# Main DS-Sim client
-# ---------------------------------------------------------
-
 def main():
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.connect((HOST, PORT))
@@ -134,7 +33,47 @@ def main():
     send(sock, f"AUTH {USER}")
     _ = recv_line(sock)  # expect "OK"
 
-    # ===== Main loop =====
+    # ===== Get static server info (GETS All) =====
+    send(sock, "GETS All")
+    header = recv_line(sock)
+
+    parts = header.split()
+    if not header.startswith("DATA") or len(parts) < 3:
+        # Clean quit if something weird happens
+        send(sock, "QUIT")
+        recv_line(sock)
+        sock.close()
+        return
+
+    n_recs = int(parts[1])
+
+    # First OK
+    send(sock, "OK")
+
+    # Parse all servers: record cores, mem, disk
+    # And initialise a "ready time" estimate for each server (for ECT)
+    servers = []  # list of (type, id, cores, mem, disk)
+    ready_time = {}  # (type, id) -> time when server becomes free in our model
+
+    for _ in range(n_recs):
+        line = recv_line(sock)
+        rec = line.split()
+        s_type = rec[0]
+        s_id = int(rec[1])
+        cores = int(rec[4])
+        mem = int(rec[5])
+        disk = int(rec[6])
+
+        servers.append((s_type, s_id, cores, mem, disk))
+        ready_time[(s_type, s_id)] = 0  # initially all free at time 0
+
+    # Second OK
+    send(sock, "OK")
+    # Read final "."
+    while recv_line(sock) != ".":
+        pass
+
+    # ===== Main scheduling loop (ECT-style) =====
     while True:
         send(sock, "REDY")
         msg = recv_line(sock)
@@ -144,55 +83,69 @@ def main():
 
         if msg == "NONE":
             send(sock, "QUIT")
-            recv_line(sock)  # final response
+            recv_line(sock)
             break
 
         if msg.startswith("JOBN") or msg.startswith("JOBP"):
             parts = msg.split()
-
-            # JOBN submitTime jobID cores memory disk estRuntime
-            job_id = parts[1]
+            
+            submit_time = int(parts[1])
+            job_id = parts[1]          
             req_cores = int(parts[3])
             req_mem = int(parts[4])
             req_disk = int(parts[5])
-            # est_runtime = int(parts[6])  # not used directly here, but available
+            est_runtime = int(parts[6])
 
-            # Request capable servers
-            send(sock, f"GETS Capable {req_cores} {req_mem} {req_disk}")
-            header = recv_line(sock)
+            # Choose server by Earliest Completion Time (ECT)
+            best_server = None
+            best_finish_time = None
 
-            if not header.startswith("DATA"):
-                continue
+            for (s_type, s_id, cores, mem, disk) in servers:
+                # Must be capable
+                if cores < req_cores or mem < req_mem or disk < req_disk:
+                    continue
 
-            n_recs = int(header.split()[1])
+                key = (s_type, s_id)
+                # When can this server actually start the new job?
+                start_time = max(ready_time[key], submit_time)
+                finish_time = start_time + est_runtime
 
-            # First OK
-            send(sock, "OK")
+                if best_finish_time is None or finish_time < best_finish_time:
+                    best_finish_time = finish_time
+                    best_server = (s_type, s_id)
+                # Tie-break: if same finish time, prefer more cores, then more mem, then smaller id
+                elif finish_time == best_finish_time:
+                    # Need cores/mem for tie-break; look them up
+                    bt, bi = best_server
+                    # find their cores/mem from servers list
+                    # (small list, so a simple scan is fine)
+                    best_cores = best_mem = 0
+                    for (t2, i2, c2, m2, d2) in servers:
+                        if t2 == bt and i2 == bi:
+                            best_cores, best_mem = c2, m2
+                            break
 
-            # Read server records
-            servers = []
-            for _ in range(n_recs):
-                line = recv_line(sock)
-                servers.append(parse_server(line))
+                    if cores > best_cores or (cores == best_cores and mem > best_mem) or (
+                        cores == best_cores and mem == best_mem and s_id < bi
+                    ):
+                        best_server = (s_type, s_id)
 
-            # Second OK
-            send(sock, "OK")
+            # Fallback: if somehow no capable server found (shouldn't happen), pick the first
+            if best_server is None:
+                s_type, s_id, _, _, _ = servers[0]
+            else:
+                s_type, s_id = best_server
 
-            # Read final "."
-            while recv_line(sock) != ".":
-                pass
+            # Update our ready_time model for that server
+            key = (s_type, s_id)
+            start_time = max(ready_time[key], submit_time)
+            ready_time[key] = start_time + est_runtime
 
-            # Choose server using aggressive TT heuristic
-            selected = choose_server(servers, req_cores, req_mem, req_disk)
-            if selected is None:
-                # Fallback: first capable
-                selected = servers[0]
-
-            send(sock, f"SCHD {job_id} {selected['type']} {selected['id']}")
+            # Send schedule command
+            send(sock, f"SCHD {job_id} {s_type} {s_id}")
             _ = recv_line(sock)  # expect "OK"
 
         elif msg.startswith("CHKQ"):
-            # Protocol check event – respond and quit cleanly
             send(sock, "OK")
             _ = recv_line(sock)
             send(sock, "QUIT")
