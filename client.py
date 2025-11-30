@@ -57,40 +57,65 @@ def parse_server(line):
 
 def choose_server(servers, need_c, need_m, need_d, est_runtime):
     """
-    Turnaround-focused heuristic (ECT-style):
+    Turnaround-focused heuristic (ECT-style), now state-aware:
 
-    1. Filter servers that can run the job.
-    2. For each eligible server, estimate a rough completion time:
+    1. Filter servers that can run the job (capacity constraint).
+    2. For each eligible server, compute a rough Estimated Completion Time (ECT):
          queue_size = waiting + running
          effective_cores = max(1, cores)
-         ect = (queue_size * est_runtime) / effective_cores
-    3. Sort by (ect, queue_size, -cores, -memory, waiting, id).
-
-    Lower ect → we expect this job to finish sooner.
+         base_ect = (queue_size + 1) * est_runtime / effective_cores
+         state penalty: active < idle < booting << inactive
+    3. Pick the server with minimal (ECT * state_penalty), tie-breaking by:
+         - smaller queue_size
+         - more cores
+         - more memory
+         - smaller id
     """
-    candidates = []
+
+    # Capacity filter
+    eligible = []
     for s in servers:
         if s["cores"] >= need_c and s["memory"] >= need_m and s["disk"] >= need_d:
-            queue_size = s["waiting"] + s["running"]
-            eff_cores = max(1, s["cores"])
-            ect = (queue_size * max(est_runtime, 1)) / eff_cores
-            candidates.append((ect, s))
+            eligible.append(s)
 
-    if not candidates:
+    if not eligible:
         return None
 
+    # State weights: penalise non-active servers to improve turnaround
+    state_weight = {
+        "active": 1.0,
+        "idle": 1.2,
+        "booting": 2.5,
+        "inactive": 50.0,   # basically avoid unless nothing else exists
+    }
+
+    candidates = []
+    for s in eligible:
+        queue_size = s["waiting"] + s["running"]
+        eff_cores = max(1, s["cores"])
+
+        # base ECT: more jobs and fewer cores -> larger time
+        base_ect = (queue_size + 1) * max(est_runtime, 1) / eff_cores
+
+        # state-aware penalty
+        penalty = state_weight.get(s["state"].lower(), 3.0)
+        ect = base_ect * penalty
+
+        candidates.append((ect, queue_size, s))
+
+    # Sort by ECT, then queue length, then cores/mem/id
     candidates.sort(
-        key=lambda pair: (
-            pair[0],                     # estimated completion time
-            pair[1]["waiting"] + pair[1]["running"],  # shorter queue
-            -pair[1]["cores"],           # more cores
-            -pair[1]["memory"],          # more memory
-            pair[1]["waiting"],          # fewer waiting jobs
-            pair[1]["id"],               # lower id
+        key=lambda x: (
+            x[0],                        # ECT (lower is better)
+            x[1],                        # smaller queue
+            -x[2]["cores"],              # more cores
+            -x[2]["memory"],             # more memory
+            x[2]["id"],                  # lower id
         )
     )
-    return candidates[0][1]
 
+    # Best candidate server
+    return candidates[0][2]
 
 # ---------------------------------------------------------
 # Main DS-Sim Client Logic (protocol SAME, heuristic NEW)
