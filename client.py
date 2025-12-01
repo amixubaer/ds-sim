@@ -5,26 +5,35 @@ HOST = "127.0.0.1"
 PORT = 50000
 USER = "ABC"
 
-def send(sock, msg):
-    sock.sendall((msg + "\n").encode())
+class BufferedSocket:
+    def __init__(self, sock):
+        self.sock = sock
+        self.buf = b""
 
-def recv_line(sock):
-    data = b""
-    while not data.endswith(b"\n"):
-        chunk = sock.recv(1)
-        if not chunk:
-            return ""
-        data += chunk
-    return data.decode().strip()
+    def send(self, msg):
+        self.sock.sendall((msg + "\n").encode())
 
-def try_recv_greeting(sock):
-    sock.settimeout(0.2)
+    def recv_line(self):
+        while b"\n" not in self.buf:
+            chunk = self.sock.recv(4096)
+            if not chunk:
+                if self.buf:
+                    line, self.buf = self.buf, b""
+                    return line.decode().strip()
+                return ""
+            self.buf += chunk
+        line, sep, rest = self.buf.partition(b"\n")
+        self.buf = rest
+        return line.decode().strip()
+
+def try_recv_greeting(bs):
+    bs.sock.settimeout(0.2)
     try:
-        _ = recv_line(sock)
+        _ = bs.recv_line()
     except Exception:
         pass
     finally:
-        sock.settimeout(None)
+        bs.sock.settimeout(None)
 
 def parse_server(line):
     p = line.split()
@@ -39,64 +48,66 @@ def parse_server(line):
         "r": int(p[8]) if len(p) > 8 else 0
     }
 
-def read_data_block(sock):
-    header = recv_line(sock)
+def read_data_block(bs):
+    header = bs.recv_line()
     parts = header.split()
     if not parts or parts[0] != "DATA":
         return []
     count = int(parts[1])
-    send(sock, "OK")
+    bs.send("OK")
     servers = []
     for _ in range(count):
-        line = recv_line(sock)
+        line = bs.recv_line()
         if line == "":
             break
         servers.append(parse_server(line))
-    # read terminating "." line
-    term = recv_line(sock)
+    # next line expected to be "."
+    term = bs.recv_line()
     if term != ".":
         # consume until we see "."
-        while term != "." and term != "":
-            term = recv_line(sock)
-    send(sock, "OK")
-    _ = recv_line(sock)  # final OK
+        while term not in ("", "."):
+            term = bs.recv_line()
+            if term == "":
+                break
+    bs.send("OK")
+    _ = bs.recv_line()  # expect "OK"
     return servers
+
+def get_capable(bs, c, m, d):
+    bs.send(f"GETS Capable {c} {m} {d}")
+    return read_data_block(bs)
 
 def choose_server(servers, need_c, need_m, need_d):
     cand = [s for s in servers if s["cores"] >= need_c and s["memory"] >= need_m and s["disk"] >= need_d]
     if not cand:
         cand = servers
-    # prefer max cores, then min waiting (w+r), then max memory, then min id
     cand.sort(key=lambda s: (-s["cores"], s["w"] + s["r"], -s["memory"], s["id"]))
     return cand[0]
 
-def get_capable(sock, c, m, d):
-    send(sock, f"GETS Capable {c} {m} {d}")
-    return read_data_block(sock)
-
 def main():
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.connect((HOST, PORT))
-    try_recv_greeting(s)
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.connect((HOST, PORT))
+    bs = BufferedSocket(sock)
+    try_recv_greeting(bs)
 
-    send(s, "HELO")
-    if recv_line(s) != "OK":
-        s.close()
+    bs.send("HELO")
+    if bs.recv_line() != "OK":
+        sock.close()
         return
 
-    send(s, f"AUTH {USER}")
-    if recv_line(s) != "OK":
-        s.close()
+    bs.send(f"AUTH {USER}")
+    if bs.recv_line() != "OK":
+        sock.close()
         return
 
     while True:
-        send(s, "REDY")
-        msg = recv_line(s)
+        bs.send("REDY")
+        msg = bs.recv_line()
         if not msg:
             break
         if msg == "NONE":
-            send(s, "QUIT")
-            recv_line(s)
+            bs.send("QUIT")
+            _ = bs.recv_line()
             break
         if msg.startswith(("JCPL", "RESF", "RESR")):
             continue
@@ -104,19 +115,19 @@ def main():
             p = msg.split()
             job_id = p[1]
             need_c = int(p[3]); need_m = int(p[4]); need_d = int(p[5])
-            servers = get_capable(s, need_c, need_m, need_d)
+            servers = get_capable(bs, need_c, need_m, need_d)
             if not servers:
                 continue
             srv = choose_server(servers, need_c, need_m, need_d)
-            send(s, f"SCHD {job_id} {srv['type']} {srv['id']}")
-            recv_line(s)
+            bs.send(f"SCHD {job_id} {srv['type']} {srv['id']}")
+            _ = bs.recv_line()
         elif msg.startswith("CHKQ"):
-            send(s, "OK")
-            recv_line(s)
-            send(s, "QUIT")
+            bs.send("OK")
+            _ = bs.recv_line()
+            bs.send("QUIT")
             break
 
-    s.close()
+    sock.close()
 
 if __name__ == "__main__":
     main()
