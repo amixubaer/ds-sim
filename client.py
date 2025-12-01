@@ -6,13 +6,11 @@ PORT = 50000
 USER = "ABC"
 
 
-def send(sock, msg: str) -> None:
-    """Send a single line (with newline) to the server."""
+def send(sock, msg):
     sock.sendall((msg + "\n").encode())
 
 
-def recv_line(sock) -> str:
-    """Receive a single newline-terminated line from the socket."""
+def recv_line(sock):
     data = b""
     while not data.endswith(b"\n"):
         chunk = sock.recv(1)
@@ -22,96 +20,55 @@ def recv_line(sock) -> str:
     return data.decode().strip()
 
 
-def parse_server(line: str):
-    """
-    Parse a server record line from GETS Capable / GETS All.
-    Typical format (brief):
-    type id state curStartTime cores mem disk wJobs rJobs [cost ...]
-    """
-    parts = line.split()
-    s_type = parts[0]
-    s_id = int(parts[1])
-    state = parts[2]
-    cores = int(parts[4])
-    mem = int(parts[5])
-    disk = int(parts[6])
-
-    w_jobs = 0
-    r_jobs = 0
-    if len(parts) > 7:
-        try:
-            w_jobs = int(parts[7])
-        except ValueError:
-            w_jobs = 0
-    if len(parts) > 8:
-        try:
-            r_jobs = int(parts[8])
-        except ValueError:
-            r_jobs = 0
-
+def parse_server(line):
+    p = line.split()
     return {
-        "type": s_type,
-        "id": s_id,
-        "state": state,
-        "cores": cores,
-        "memory": mem,
-        "disk": disk,
-        "wJobs": w_jobs,
-        "rJobs": r_jobs,
+        "type": p[0],
+        "id": int(p[1]),
+        "state": p[2],
+        "cores": int(p[4]),
+        "memory": int(p[5]),
+        "disk": int(p[6]),
+        "w": int(p[7]) if len(p) > 7 else 0,
+        "r": int(p[8]) if len(p) > 8 else 0,
     }
 
 
-def choose_server(servers, need_c, need_m, need_d):
-    """
-    Heuristic:
-    - Filter capable servers.
-    - Sort by:
-        1) fewest (wJobs + rJobs)
-        2) smallest (cores - need_c)
-        3) largest cores
-        4) largest memory
-        5) smallest id
-    """
-    candidates = []
-    for s in servers:
-        if s["cores"] >= need_c and s["memory"] >= need_m and s["disk"] >= need_d:
-            load = s["wJobs"] + s["rJobs"]
-            core_gap = s["cores"] - need_c
-            # store tuple for sorting plus the record itself
-            candidates.append((
-                load,                # smaller is better
-                core_gap,            # smaller is better
-                -s["cores"],         # larger is better
-                -s["memory"],        # larger is better
-                s["id"],             # smaller is better
-                s,
-            ))
+def choose_server(servers, need_c):
+    # ----- Step 1: Find the fastest server type (max cores) -----
+    max_cores = max(s["cores"] for s in servers)
+    fastest_type = [s for s in servers if s["cores"] == max_cores]
 
-    if not candidates:
-        return None
+    # Check the load of fastest servers
+    fastest_sorted = sorted(fastest_type, key=lambda s: (s["w"] + s["r"], s["id"]))
 
-    candidates.sort(key=lambda t: (t[0], t[1], t[2], t[3], t[4]))
-    return candidates[0][5]
+    # If the first 3 fastest servers are not overloaded → choose fastest (FAFC behaviour)
+    top_loads = sorted([(s["w"] + s["r"]) for s in fastest_type])[:3]
+    if all(load == 0 for load in top_loads):
+        return fastest_sorted[0]
+
+    # Otherwise fallback to balanced (your method)
+    return sorted(
+        servers,
+        key=lambda s: (
+            s["w"] + s["r"],         # least load
+            s["cores"] - need_c,    # tightest fit
+            -s["cores"],            # prefer bigger servers
+            s["id"]                 # stable
+        )
+    )[0]
 
 
 def main():
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.connect((HOST, PORT))
 
-    # ===== Handshake =====
-    send(sock, "HELO")
-    _ = recv_line(sock)  # "OK"
+    send(sock, "HELO"); recv_line(sock)
+    send(sock, f"AUTH {USER}"); recv_line(sock)
 
-    send(sock, f"AUTH {USER}")
-    _ = recv_line(sock)  # "OK"
-
-    # ===== Main loop =====
     while True:
         send(sock, "REDY")
         msg = recv_line(sock)
-
-        if not msg:
-            break
 
         if msg == "NONE":
             send(sock, "QUIT")
@@ -119,50 +76,25 @@ def main():
             break
 
         if msg.startswith("JOBN") or msg.startswith("JOBP"):
-            parts = msg.split()
-            job_id = parts[1]
-            req_cores = int(parts[3])
-            req_mem = int(parts[4])
-            req_disk = int(parts[5])
-           
-            # Ask for capable servers
-            send(sock, f"GETS Capable {req_cores} {req_mem} {req_disk}")
+            p = msg.split()
+            job_id = p[1]
+            need_c = int(p[3])
+            need_m = int(p[4])
+            need_d = int(p[5])
+
+            send(sock, f"GETS Capable {need_c} {need_m} {need_d}")
             header = recv_line(sock)
+            count = int(header.split()[1])
 
-            if not header.startswith("DATA"):
-                # Something unexpected, just continue to next REDY
-                continue
-
-            n_recs = int(header.split()[1])
-
-            # First OK
             send(sock, "OK")
-
-            servers = []
-            for _ in range(n_recs):
-                line = recv_line(sock)
-                servers.append(parse_server(line))
-
-            # Second OK
+            servers = [parse_server(recv_line(sock)) for _ in range(count)]
             send(sock, "OK")
+            recv_line(sock)  # '.'
 
-            # Read final "."
-            while recv_line(sock) != ".":
-                pass
+            chosen = choose_server(servers, need_c)
 
-            selected = choose_server(servers, req_cores, req_mem, req_disk)
-            if selected is None:
-                # Fallback: just use first record if somehow none were "capable"
-                selected = servers[0]
-
-            send(sock, f"SCHD {job_id} {selected['type']} {selected['id']}")
-            _ = recv_line(sock)  # "OK"
-
-        elif msg.startswith("CHKQ"):
-            send(sock, "OK")
-            _ = recv_line(sock)
-            send(sock, "QUIT")
-            break
+            send(sock, f"SCHD {job_id} {chosen['type']} {chosen['id']}")
+            recv_line(sock)
 
     sock.close()
 
