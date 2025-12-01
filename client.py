@@ -34,29 +34,21 @@ def parse_server(line):
     }
 
 
-def choose_server(servers, need_c):
-    # ----- Step 1: Find the fastest server type (max cores) -----
+def choose_server(servers, req_cores):
+    # Step 1: fastest server type = max cores
     max_cores = max(s["cores"] for s in servers)
-    fastest_type = [s for s in servers if s["cores"] == max_cores]
+    fastest = [s for s in servers if s["cores"] == max_cores]
 
-    # Check the load of fastest servers
-    fastest_sorted = sorted(fastest_type, key=lambda s: (s["w"] + s["r"], s["id"]))
-
-    # If the first 3 fastest servers are not overloaded → choose fastest (FAFC behaviour)
-    top_loads = sorted([(s["w"] + s["r"]) for s in fastest_type])[:3]
-    if all(load == 0 for load in top_loads):
-        return fastest_sorted[0]
-
-    # Otherwise fallback to balanced (your method)
-    return sorted(
-        servers,
+    # Step 2: sort FASTEST servers only (do not fall back)
+    fastest_sorted = sorted(
+        fastest,
         key=lambda s: (
-            s["w"] + s["r"],         # least load
-            s["cores"] - need_c,    # tightest fit
-            -s["cores"],            # prefer bigger servers
-            s["id"]                 # stable
+            s["w"] + s["r"],            # smallest queue
+            s["cores"] - req_cores,     # tightest core fit
+            s["id"]                     # stable
         )
-    )[0]
+    )
+    return fastest_sorted[0]
 
 
 def main():
