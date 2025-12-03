@@ -2,7 +2,7 @@
 import socket
 
 HOST = "127.0.0.1"
-PORT = 50000
+PORT = 5972
 USER = "ABC"
 
 def send(sock, msg):
