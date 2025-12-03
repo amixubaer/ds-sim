@@ -39,7 +39,7 @@ def parse_server(line):
             s["running"] = 0
     return s
 
-def choose_server_optimized(servers, need_c, need_m, need_d, est_runtime):
+def choose_server_final(servers, need_c, need_m, need_d, est_runtime):
     eligible = []
     for s in servers:
         if s["cores"] >= need_c and s["memory"] >= need_m and s["disk"] >= need_d:
@@ -48,38 +48,41 @@ def choose_server_optimized(servers, need_c, need_m, need_d, est_runtime):
     if not eligible:
         return None
 
-    # State penalties (relative to job runtime)
-    state_penalty = {
-        "active": 0.0,      # No penalty
-        "idle": 0.5,        # Small penalty
-        "booting": 1.5,     # Medium penalty
-        "inactive": 3.0,    # Larger penalty
-    }
+    # For very short jobs, use simple first-fit (like FF algorithm)
+    if est_runtime < 300:
+        eligible.sort(key=lambda s: (
+            0 if s["state"] == "active" else 1,
+            s["cores"],
+            s["id"]
+        ))
+        return eligible[0]
+
+    # For longer jobs, use optimized scheduling
+    if est_runtime < 1000:
+        state_penalty = {"active": 0.0, "idle": 0.3, "booting": 1.0, "inactive": 2.0}
+    else:
+        state_penalty = {"active": 0.0, "idle": 0.2, "booting": 0.5, "inactive": 1.0}
 
     candidates = []
     for s in eligible:
-        # Estimate waiting time
         if s["cores"] > 0:
             queue_time = (s["waiting"] + s["running"]) * est_runtime / s["cores"]
         else:
             queue_time = 1000000
         
-        penalty = state_penalty.get(s["state"].lower(), 5.0) * est_runtime
+        penalty = state_penalty.get(s["state"].lower(), 3.0) * est_runtime
         
-        # Prefer better core fit (higher utilization)
         utilization_factor = (s["cores"] - need_c) / s["cores"] if s["cores"] > 0 else 1.0
         
-        # Balanced score
-        total_score = (queue_time + penalty) * (1 + 0.3 * utilization_factor)
+        total_score = (queue_time + penalty) * (1 + 0.2 * utilization_factor)
         
         candidates.append((total_score, s))
 
-    # Sort for best overall performance
     candidates.sort(key=lambda x: (
-        x[0],                        # Balanced score
-        -x[1]["cores"],              # More cores
-        x[1]["waiting"],             # Fewer waiting jobs
-        x[1]["id"],                  # Lower ID
+        x[0],
+        -x[1]["cores"],
+        x[1]["waiting"],
+        x[1]["id"],
     ))
 
     return candidates[0][1]
@@ -157,7 +160,7 @@ def main():
                     break
 
             # Choose server
-            selected = choose_server_optimized(servers, req_cores, req_mem, req_disk, est_runtime)
+            selected = choose_server_final(servers, req_cores, req_mem, req_disk, est_runtime)
 
             if selected is None:
                 f = servers[0]
