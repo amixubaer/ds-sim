@@ -6,154 +6,150 @@ PORT = 50000
 USER = "ABC"
 
 def send(sock, msg):
-    if not msg.endswith('\n'):
-        msg += '\n'
+    if not msg.endswith("\n"):
+        msg += "\n"
     sock.sendall(msg.encode())
 
 def recv_line(sock):
     data = b""
-    while not data.endswith(b'\n'):
-        chunk = sock.recv(1)
+    while not data.endswith(b"\n"):
+        chunk = sock.recv(4096)
         if not chunk:
             break
         data += chunk
     return data.decode().strip()
 
+def try_read_initial(sock):
+    sock.settimeout(0.2)
+    try:
+        _ = recv_line(sock)
+    except Exception:
+        pass
+    finally:
+        sock.settimeout(None)
+
 def parse_server(line):
-    parts = line.split()
-    if len(parts) < 8:
+    p = line.split()
+    if len(p) < 7:
         return None
+    waiting = 0
+    if len(p) > 7:
+        try:
+            waiting = int(p[7])
+        except Exception:
+            waiting = 0
     return {
-        "type": parts[0],
-        "id": int(parts[1]),
-        "state": parts[2],
-        "cores": int(parts[4]),
-        "memory": int(parts[5]),
-        "disk": int(parts[6]),
-        "waiting": int(parts[7])
+        "type": p[0],
+        "id": int(p[1]),
+        "state": p[2],
+        "cores": int(p[4]),
+        "memory": int(p[5]),
+        "disk": int(p[6]),
+        "waiting": waiting
     }
 
-def choose_server_optimized(servers, need_c, need_m, need_d):
-    eligible = []
-    for s in servers:
-        if s["cores"] >= need_c and s["memory"] >= need_m and s["disk"] >= need_d:
-            eligible.append(s)
-
-    if not eligible:
-        return None
-
+def choose_server(servers, need_c):
+    # Best-fit on cores (minimize cores - need_c >= 0), then fewest waiting,
+    # then prefer active/idle, then lower id.
+    state_rank = {"active": 0, "idle": 1, "booting": 2, "inactive": 3}
     candidates = []
-    for s in eligible:
-        # Core utilization (for resource utilization metric)
-        core_util = need_c / s["cores"] if s["cores"] > 0 else 0
-        
-        # Queue impact (for turnaround metric)
-        queue_impact = s["waiting"] * 100
-        
-        # State impact (for cost/turnaround)
-        state_impact = {"active": 0, "idle": 50, "booting": 150, "inactive": 300}.get(s["state"], 500)
-        
-        # Balanced score
-        total_score = (
-            (1 - core_util) * 40 +  # Prefer higher utilization
-            queue_impact * 0.4 +    # Prefer shorter queues
-            state_impact * 0.2      # Prefer ready servers
-        )
-        
-        candidates.append((total_score, s))
+    for s in servers:
+        if s["cores"] >= need_c:
+            core_gap = s["cores"] - need_c
+            candidates.append((core_gap, s["waiting"], state_rank.get(s["state"], 99), s["id"], s))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: (x[0], x[1], x[2], x[3]))
+    return candidates[0][4]
 
-    # Sort for best overall performance
-    candidates.sort(key=lambda x: (
-        x[0],                        # Balanced score
-        x[1]["waiting"],             # Turnaround: fewer waiting
-        -x[1]["cores"],              # Utilization: more cores
-        x[1]["id"],                  # Consistency: lower ID
-    ))
-
-    return candidates[0][1]
+def read_data_block(sock):
+    header = recv_line(sock)
+    if not header.startswith("DATA"):
+        return []
+    n = int(header.split()[1])
+    send(sock, "OK")
+    recs = []
+    for _ in range(n):
+        line = recv_line(sock)
+        rec = parse_server(line)
+        if rec:
+            recs.append(rec)
+    send(sock, "OK")
+    # consume terminating line ('.')
+    while True:
+        t = recv_line(sock)
+        if t == ".":
+            break
+    return recs
 
 def main():
-    try:
-        sock = socket.create_connection((HOST, PORT), timeout=5)
-    except Exception:
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.connect((HOST, PORT))
+    try_read_initial(s)
+
+    send(s, "HELO")
+    if recv_line(s) != "OK":
+        s.close()
         return
 
-    # Handshake
-    send(sock, "HELO\n")
-    if recv_line(sock) != "OK":
-        sock.close()
+    send(s, f"AUTH {USER}")
+    if recv_line(s) != "OK":
+        s.close()
         return
 
-    send(sock, f"AUTH {USER}\n")
-    if recv_line(sock) != "OK":
-        sock.close()
-        return
-
-    # Main event loop
     while True:
-        send(sock, "REDY\n")
-        msg = recv_line(sock)
-
+        send(s, "REDY")
+        msg = recv_line(s)
         if not msg:
             break
-
         if msg == "NONE":
-            send(sock, "QUIT\n")
-            recv_line(sock)
+            send(s, "QUIT")
+            _ = recv_line(s)
             break
-
-        parts = msg.split()
-
-        # Handle job scheduling
-        if parts[0] in ["JOBN", "JOBP"] and len(parts) >= 7:
+        if msg.startswith(("JCPL", "RESF", "RESR")):
+            continue
+        if msg.startswith(("JOBN", "JOBP")):
+            parts = msg.split()
+            if len(parts) < 7:
+                continue
             job_id = parts[1]
-            req_cores = int(parts[3])
-            req_mem = int(parts[4])
-            req_disk = int(parts[5])
+            need_c = int(parts[3])
+            need_m = int(parts[4])
+            need_d = int(parts[5])
 
-            # Get capable servers
-            send(sock, f"GETS Capable {req_cores} {req_mem} {req_disk}\n")
-            header = recv_line(sock)
-
+            send(s, f"GETS Capable {need_c} {need_m} {need_d}")
+            header = recv_line(s)
             if not header.startswith("DATA"):
                 continue
-
-            count = int(header.split()[1])
-            send(sock, "OK\n")
-
-            # Read server records
+            n = int(header.split()[1])
+            send(s, "OK")
             servers = []
-            for _ in range(count):
-                line = recv_line(sock)
-                server = parse_server(line)
-                if server:
-                    servers.append(server)
+            for _ in range(n):
+                line = recv_line(s)
+                rec = parse_server(line)
+                if rec:
+                    servers.append(rec)
+            send(s, "OK")
+            # consume terminating "."
+            while True:
+                t = recv_line(s)
+                if t == ".":
+                    break
 
-            send(sock, "OK\n")
-
-            # Read until "."
-            while recv_line(sock) != ".":
-                pass
-
-            # Choose server
-            selected = choose_server_optimized(servers, req_cores, req_mem, req_disk)
-
+            selected = choose_server(servers, need_c)
             if selected is None and servers:
                 selected = servers[0]
-
             if selected:
-                send(sock, f"SCHD {job_id} {selected['type']} {selected['id']}\n")
-                recv_line(sock)
-
-        # Handle check queue
-        elif parts[0] == "CHKQ":
-            send(sock, "OK\n")
-            recv_line(sock)
-            send(sock, "QUIT\n")
-            recv_line(sock)
+                send(s, f"SCHD {job_id} {selected['type']} {selected['id']}")
+                _ = recv_line(s)
+        elif msg.startswith("CHKQ"):
+            send(s, "OK")
+            _ = recv_line(s)
+            send(s, "QUIT")
+            _ = recv_line(s)
             break
 
-    sock.close()
+    s.close()
 
 if __name__ == "__main__":
     main()
