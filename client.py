@@ -33,12 +33,7 @@ def parse_server(line):
         "waiting": int(parts[7])
     }
 
-def choose_server_final(servers, need_c, need_m, need_d):
-    """
-    Optimized TFPS with runtime awareness:
-    - For high-load situations, be more aggressive with server selection
-    - Consider waiting jobs more heavily
-    """
+def choose_server_optimized(servers, need_c, need_m, need_d):
     eligible = []
     for s in servers:
         if s["cores"] >= need_c and s["memory"] >= need_m and s["disk"] >= need_d:
@@ -47,35 +42,32 @@ def choose_server_final(servers, need_c, need_m, need_d):
     if not eligible:
         return None
 
-    # Score each server
     candidates = []
     for s in eligible:
-        # Core gap (smaller is better)
-        core_gap = s["cores"] - need_c
+        # Core utilization (for resource utilization metric)
+        core_util = need_c / s["cores"] if s["cores"] > 0 else 0
         
-        # State priority
-        state_score = {
-            "active": 0,
-            "idle": 1,
-            "booting": 2,
-            "inactive": 3
-        }.get(s["state"], 4)
+        # Queue impact (for turnaround metric)
+        queue_impact = s["waiting"] * 100
         
-        # Total score = core_gap + state_priority + waiting_jobs
-        # Weights: core_gap (40%), state (30%), waiting (30%)
+        # State impact (for cost/turnaround)
+        state_impact = {"active": 0, "idle": 50, "booting": 150, "inactive": 300}.get(s["state"], 500)
+        
+        # Balanced score
         total_score = (
-            core_gap * 0.4 +
-            state_score * 0.3 +
-            s["waiting"] * 0.3
+            (1 - core_util) * 40 +  # Prefer higher utilization
+            queue_impact * 0.4 +    # Prefer shorter queues
+            state_impact * 0.2      # Prefer ready servers
         )
         
         candidates.append((total_score, s))
 
-    # Sort by score, then memory (higher better), then id
+    # Sort for best overall performance
     candidates.sort(key=lambda x: (
-        x[0],                        # Total score
-        -x[1]["memory"],             # More memory
-        x[1]["id"],                  # Lower ID
+        x[0],                        # Balanced score
+        x[1]["waiting"],             # Turnaround: fewer waiting
+        -x[1]["cores"],              # Utilization: more cores
+        x[1]["id"],                  # Consistency: lower ID
     ))
 
     return candidates[0][1]
@@ -144,7 +136,7 @@ def main():
                 pass
 
             # Choose server
-            selected = choose_server_final(servers, req_cores, req_mem, req_disk)
+            selected = choose_server_optimized(servers, req_cores, req_mem, req_disk)
 
             if selected is None and servers:
                 selected = servers[0]
