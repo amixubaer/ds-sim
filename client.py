@@ -6,40 +6,43 @@ PORT = 50000
 USER = "ABC"
 
 def send(sock, msg):
-    sock.sendall(msg.encode("ascii"))
+    if not msg.endswith('\n'):
+        msg += '\n'
+    sock.sendall(msg.encode())
 
-def receive(sock, timeout=2):
-    sock.settimeout(timeout)
-    try:
-        data = sock.recv(8192)
-        if not data:
-            return ""
-        return data.decode("ascii", errors="ignore").strip()
-    except:
-        return ""
+def recv_line(sock):
+    data = b""
+    while not data.endswith(b'\n'):
+        chunk = sock.recv(1)
+        if not chunk:
+            break
+        data += chunk
+    return data.decode().strip()
 
 def parse_server(line):
     parts = line.split()
-    s = {
+    if len(parts) < 8:
+        return None
+    return {
         "type": parts[0],
         "id": int(parts[1]),
         "state": parts[2],
         "cores": int(parts[4]),
         "memory": int(parts[5]),
         "disk": int(parts[6]),
-        "waiting": 0,
-        "running": 0,
+        "waiting": int(parts[7])
     }
-    if len(parts) >= 9:
-        try:
-            s["waiting"] = int(parts[7])
-            s["running"] = int(parts[8])
-        except ValueError:
-            s["waiting"] = 0
-            s["running"] = 0
-    return s
 
-def choose_server_final(servers, need_c, need_m, need_d, est_runtime):
+def choose_server_tfps(servers, need_c, need_m, need_d):
+    """
+    Tiered Fit Priority Scheduler (optimized version):
+    1. Filter capable servers
+    2. Find smallest core gap
+    3. Pick highest memory in that gap
+    4. Prioritize state: active > idle > booting > inactive
+    5. Break ties with waiting jobs
+    """
+    # 1. Filter capable servers
     eligible = []
     for s in servers:
         if s["cores"] >= need_c and s["memory"] >= need_m and s["disk"] >= need_d:
@@ -48,136 +51,111 @@ def choose_server_final(servers, need_c, need_m, need_d, est_runtime):
     if not eligible:
         return None
 
-    # For very short jobs, use simple first-fit (like FF algorithm)
-    if est_runtime < 300:
-        eligible.sort(key=lambda s: (
-            0 if s["state"] == "active" else 1,
-            s["cores"],
-            s["id"]
-        ))
-        return eligible[0]
-
-    # For longer jobs, use optimized scheduling
-    if est_runtime < 1000:
-        state_penalty = {"active": 0.0, "idle": 0.3, "booting": 1.0, "inactive": 2.0}
-    else:
-        state_penalty = {"active": 0.0, "idle": 0.2, "booting": 0.5, "inactive": 1.0}
-
-    candidates = []
+    # 2. Compute core gap and find smallest
     for s in eligible:
-        if s["cores"] > 0:
-            queue_time = (s["waiting"] + s["running"]) * est_runtime / s["cores"]
-        else:
-            queue_time = 1000000
-        
-        penalty = state_penalty.get(s["state"].lower(), 3.0) * est_runtime
-        
-        utilization_factor = (s["cores"] - need_c) / s["cores"] if s["cores"] > 0 else 1.0
-        
-        total_score = (queue_time + penalty) * (1 + 0.2 * utilization_factor)
-        
-        candidates.append((total_score, s))
+        s["core_gap"] = s["cores"] - need_c
 
-    candidates.sort(key=lambda x: (
-        x[0],
-        -x[1]["cores"],
-        x[1]["waiting"],
-        x[1]["id"],
-    ))
+    eligible.sort(key=lambda x: x["core_gap"])
+    best_gap = eligible[0]["core_gap"]
 
-    return candidates[0][1]
+    # 3. Keep only servers with best gap
+    gap_group = [s for s in eligible if s["core_gap"] == best_gap]
+
+    # 4. From this tier, pick highest memory
+    gap_group.sort(key=lambda x: x["memory"], reverse=True)
+    max_mem = gap_group[0]["memory"]
+    mem_group = [s for s in gap_group if s["memory"] == max_mem]
+
+    # 5. Break ties by state
+    state_priority = {"active": 0, "idle": 1, "booting": 2, "inactive": 3}
+    mem_group.sort(key=lambda x: state_priority.get(x["state"], 99))
+
+    # 6. Final tie breaker: fewest waiting jobs
+    mem_group.sort(key=lambda x: x["waiting"])
+
+    return mem_group[0]
 
 def main():
     try:
-        sock = socket.create_connection((HOST, PORT), timeout=1)
-    except:
+        sock = socket.create_connection((HOST, PORT), timeout=5)
+    except Exception:
         return
 
-    # Handshake 
+    # Handshake with proper newlines
     send(sock, "HELO\n")
-    if receive(sock) != "OK":
+    if recv_line(sock) != "OK":
         sock.close()
         return
 
     send(sock, f"AUTH {USER}\n")
-    if receive(sock) != "OK":
+    if recv_line(sock) != "OK":
         sock.close()
         return
 
     # Main event loop
     while True:
         send(sock, "REDY\n")
-        msg = receive(sock)
+        msg = recv_line(sock)
 
         if not msg:
             break
 
         if msg == "NONE":
             send(sock, "QUIT\n")
-            receive(sock)
+            recv_line(sock)
             break
 
-        if msg.startswith("JOBN") or msg.startswith("JOBP"):
-            parts = msg.split()
+        parts = msg.split()
+
+        # Handle job scheduling
+        if parts[0] in ["JOBN", "JOBP"] and len(parts) >= 7:
             job_id = parts[1]
             req_cores = int(parts[3])
             req_mem = int(parts[4])
             req_disk = int(parts[5])
-            est_runtime = int(parts[6])
 
-            # Request capable servers
+            # Get capable servers
             send(sock, f"GETS Capable {req_cores} {req_mem} {req_disk}\n")
-            header = receive(sock)
+            header = recv_line(sock)
 
             if not header.startswith("DATA"):
                 continue
 
             count = int(header.split()[1])
-
-            # First OK
             send(sock, "OK\n")
 
-            # Read N server lines
+            # Read server records
             servers = []
-            while len(servers) < count:
-                chunk = receive(sock)
-                if not chunk:
-                    break
-                for line in chunk.split("\n"):
-                    line = line.strip()
-                    if line:
-                        servers.append(parse_server(line))
-                        if len(servers) == count:
-                            break
+            for _ in range(count):
+                line = recv_line(sock)
+                server = parse_server(line)
+                if server:
+                    servers.append(server)
 
-            # Second OK
             send(sock, "OK\n")
 
-            # Wait for "."
-            while True:
-                endmsg = receive(sock)
-                if "." in endmsg:
-                    break
+            # Read until "."
+            while recv_line(sock) != ".":
+                pass
 
-            # Choose server
-            selected = choose_server_final(servers, req_cores, req_mem, req_disk, est_runtime)
+            # Choose server with TFPS
+            selected = choose_server_tfps(servers, req_cores, req_mem, req_disk)
 
-            if selected is None:
-                f = servers[0]
-                send(sock, f"SCHD {job_id} {f['type']} {f['id']}\n")
-                receive(sock)
-            else:
+            if selected is None and servers:
+                # Fallback to first server
+                selected = servers[0]
+
+            if selected:
                 send(sock, f"SCHD {job_id} {selected['type']} {selected['id']}\n")
-                receive(sock)
+                recv_line(sock)
 
-        elif msg.startswith("CHKQ"):
+        # Handle check queue
+        elif parts[0] == "CHKQ":
             send(sock, "OK\n")
-            receive(sock)
+            recv_line(sock)
             send(sock, "QUIT\n")
+            recv_line(sock)
             break
-
-        else:
-            continue
 
     sock.close()
 
