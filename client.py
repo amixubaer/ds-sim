@@ -5,10 +5,6 @@ HOST = "127.0.0.1"
 PORT = 50000
 USER = "ABC"
 
-# ---------------------------------------------------------
-# Basic network helpers (UNCHANGED PROTOCOL)
-# ---------------------------------------------------------
-
 def send(sock, msg):
     sock.sendall(msg.encode("ascii"))
 
@@ -22,18 +18,7 @@ def receive(sock, timeout=2):
     except:
         return ""
 
-
-# ---------------------------------------------------------
-# Server parsing & selection (OPTIMISED)
-# ---------------------------------------------------------
-
 def parse_server(line):
-    """
-    Expected format from ds-server (brief mode):
-      type id state curStartTime cores memory disk wJobs rJobs [cost ...]
-
-    We keep everything you used before, and ALSO read rJobs.
-    """
     parts = line.split()
     s = {
         "type": parts[0],
@@ -54,25 +39,15 @@ def parse_server(line):
             s["running"] = 0
     return s
 
-
-def choose_server(servers, need_c, need_m, need_d, est_runtime):
+def choose_server_optimized(servers, need_c, need_m, need_d, est_runtime):
     """
-    Turnaround-focused heuristic (ECT-style), now state-aware:
-
-    1. Filter servers that can run the job (capacity constraint).
-    2. For each eligible server, compute a rough Estimated Completion Time (ECT):
-         queue_size = waiting + running
-         effective_cores = max(1, cores)
-         base_ect = (queue_size + 1) * est_runtime / effective_cores
-         state penalty: active < idle < booting << inactive
-    3. Pick the server with minimal (ECT * state_penalty), tie-breaking by:
-         - smaller queue_size
-         - more cores
-         - more memory
-         - smaller id
+    Optimized for turnaround time:
+    1. Filter capable servers
+    2. Score = (waiting_time_estimate + state_penalty)
+    3. waiting_time_estimate = (waiting + running) * est_runtime / cores
+    4. State penalties: active(0), idle(1), booting(5), inactive(10)
+    5. Prefer servers with HIGHER cores (for parallel execution)
     """
-
-    # Capacity filter
     eligible = []
     for s in servers:
         if s["cores"] >= need_c and s["memory"] >= need_m and s["disk"] >= need_d:
@@ -81,45 +56,38 @@ def choose_server(servers, need_c, need_m, need_d, est_runtime):
     if not eligible:
         return None
 
-    # State weights: penalise non-active servers to improve turnaround
-    state_weight = {
-        "active": 1.0,
-        "idle": 1.2,
-        "booting": 2.5,
-        "inactive": 50.0,   # basically avoid unless nothing else exists
+    # State penalties (lower is better)
+    state_penalty = {
+        "active": 0,      # Immediately available
+        "idle": 1,        # Available but might need wake-up
+        "booting": 5,     # Boot time penalty
+        "inactive": 10,   # Boot time + activation penalty
     }
 
     candidates = []
     for s in eligible:
-        queue_size = s["waiting"] + s["running"]
-        eff_cores = max(1, s["cores"])
+        # Estimate waiting time based on queue and cores
+        if s["cores"] > 0:
+            queue_time = (s["waiting"] + s["running"]) * est_runtime / s["cores"]
+        else:
+            queue_time = 1000000  # Large penalty if no cores (shouldn't happen)
+        
+        penalty = state_penalty.get(s["state"].lower(), 20)
+        
+        # Total score = queue_time + state_penalty
+        total_score = queue_time + penalty
+        
+        candidates.append((total_score, s))
 
-        # base ECT: more jobs and fewer cores -> larger time
-        base_ect = (queue_size + 1) * max(est_runtime, 1) / eff_cores
+    # Sort by total_score (lower is better), then prefer more cores for parallelism
+    candidates.sort(key=lambda x: (
+        x[0],                        # Total score
+        -x[1]["cores"],              # More cores (for parallel execution)
+        x[1]["waiting"],             # Fewer waiting jobs
+        x[1]["id"],                  # Lower server ID
+    ))
 
-        # state-aware penalty
-        penalty = state_weight.get(s["state"].lower(), 3.0)
-        ect = base_ect * penalty
-
-        candidates.append((ect, queue_size, s))
-
-    # Sort by ECT, then queue length, then cores/mem/id
-    candidates.sort(
-        key=lambda x: (
-            x[0],                        # ECT (lower is better)
-            x[1],                        # smaller queue
-            -x[2]["cores"],              # more cores
-            -x[2]["memory"],             # more memory
-            x[2]["id"],                  # lower id
-        )
-    )
-
-    # Best candidate server
-    return candidates[0][2]
-
-# ---------------------------------------------------------
-# Main DS-Sim Client Logic (protocol SAME, heuristic NEW)
-# ---------------------------------------------------------
+    return candidates[0][1]
 
 def main():
     try:
@@ -146,13 +114,11 @@ def main():
         if not msg:
             break
 
-        # Simulator finishes
         if msg == "NONE":
             send(sock, "QUIT\n")
             receive(sock)
             break
 
-        # Normal job event
         if msg.startswith("JOBN") or msg.startswith("JOBP"):
             parts = msg.split()
             job_id = parts[1]
@@ -195,8 +161,8 @@ def main():
                 if "." in endmsg:
                     break
 
-            # Choose server with ECT-based heuristic
-            selected = choose_server(servers, req_cores, req_mem, req_disk, est_runtime)
+            # Choose server with optimized heuristic
+            selected = choose_server_optimized(servers, req_cores, req_mem, req_disk, est_runtime)
 
             if selected is None:
                 # fallback: just take first server in list
@@ -207,19 +173,16 @@ def main():
                 send(sock, f"SCHD {job_id} {selected['type']} {selected['id']}\n")
                 receive(sock)
 
-        # Protocol check handling
         elif msg.startswith("CHKQ"):
             send(sock, "OK\n")
             receive(sock)
             send(sock, "QUIT\n")
             break
 
-        # Completed job / other events → ignore and continue
         else:
             continue
 
     sock.close()
-
 
 if __name__ == "__main__":
     main()
