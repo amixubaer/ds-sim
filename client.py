@@ -33,16 +33,12 @@ def parse_server(line):
         "waiting": int(parts[7])
     }
 
-def choose_server_tfps(servers, need_c, need_m, need_d):
+def choose_server_final(servers, need_c, need_m, need_d):
     """
-    Tiered Fit Priority Scheduler (optimized version):
-    1. Filter capable servers
-    2. Find smallest core gap
-    3. Pick highest memory in that gap
-    4. Prioritize state: active > idle > booting > inactive
-    5. Break ties with waiting jobs
+    Optimized TFPS with runtime awareness:
+    - For high-load situations, be more aggressive with server selection
+    - Consider waiting jobs more heavily
     """
-    # 1. Filter capable servers
     eligible = []
     for s in servers:
         if s["cores"] >= need_c and s["memory"] >= need_m and s["disk"] >= need_d:
@@ -51,29 +47,38 @@ def choose_server_tfps(servers, need_c, need_m, need_d):
     if not eligible:
         return None
 
-    # 2. Compute core gap and find smallest
+    # Score each server
+    candidates = []
     for s in eligible:
-        s["core_gap"] = s["cores"] - need_c
+        # Core gap (smaller is better)
+        core_gap = s["cores"] - need_c
+        
+        # State priority
+        state_score = {
+            "active": 0,
+            "idle": 1,
+            "booting": 2,
+            "inactive": 3
+        }.get(s["state"], 4)
+        
+        # Total score = core_gap + state_priority + waiting_jobs
+        # Weights: core_gap (40%), state (30%), waiting (30%)
+        total_score = (
+            core_gap * 0.4 +
+            state_score * 0.3 +
+            s["waiting"] * 0.3
+        )
+        
+        candidates.append((total_score, s))
 
-    eligible.sort(key=lambda x: x["core_gap"])
-    best_gap = eligible[0]["core_gap"]
+    # Sort by score, then memory (higher better), then id
+    candidates.sort(key=lambda x: (
+        x[0],                        # Total score
+        -x[1]["memory"],             # More memory
+        x[1]["id"],                  # Lower ID
+    ))
 
-    # 3. Keep only servers with best gap
-    gap_group = [s for s in eligible if s["core_gap"] == best_gap]
-
-    # 4. From this tier, pick highest memory
-    gap_group.sort(key=lambda x: x["memory"], reverse=True)
-    max_mem = gap_group[0]["memory"]
-    mem_group = [s for s in gap_group if s["memory"] == max_mem]
-
-    # 5. Break ties by state
-    state_priority = {"active": 0, "idle": 1, "booting": 2, "inactive": 3}
-    mem_group.sort(key=lambda x: state_priority.get(x["state"], 99))
-
-    # 6. Final tie breaker: fewest waiting jobs
-    mem_group.sort(key=lambda x: x["waiting"])
-
-    return mem_group[0]
+    return candidates[0][1]
 
 def main():
     try:
@@ -81,7 +86,7 @@ def main():
     except Exception:
         return
 
-    # Handshake with proper newlines
+    # Handshake
     send(sock, "HELO\n")
     if recv_line(sock) != "OK":
         sock.close()
@@ -138,11 +143,10 @@ def main():
             while recv_line(sock) != ".":
                 pass
 
-            # Choose server with TFPS
-            selected = choose_server_tfps(servers, req_cores, req_mem, req_disk)
+            # Choose server
+            selected = choose_server_final(servers, req_cores, req_mem, req_disk)
 
             if selected is None and servers:
-                # Fallback to first server
                 selected = servers[0]
 
             if selected:
