@@ -40,14 +40,6 @@ def parse_server(line):
     return s
 
 def choose_server_optimized(servers, need_c, need_m, need_d, est_runtime):
-    """
-    Optimized for turnaround time:
-    1. Filter capable servers
-    2. Score = (waiting_time_estimate + state_penalty)
-    3. waiting_time_estimate = (waiting + running) * est_runtime / cores
-    4. State penalties: active(0), idle(1), booting(5), inactive(10)
-    5. Prefer servers with HIGHER cores (for parallel execution)
-    """
     eligible = []
     for s in servers:
         if s["cores"] >= need_c and s["memory"] >= need_m and s["disk"] >= need_d:
@@ -56,35 +48,38 @@ def choose_server_optimized(servers, need_c, need_m, need_d, est_runtime):
     if not eligible:
         return None
 
-    # State penalties (lower is better)
+    # State penalties (relative to job runtime)
     state_penalty = {
-        "active": 0,      # Immediately available
-        "idle": 1,        # Available but might need wake-up
-        "booting": 5,     # Boot time penalty
-        "inactive": 10,   # Boot time + activation penalty
+        "active": 0.0,      # No penalty
+        "idle": 0.5,        # Small penalty
+        "booting": 1.5,     # Medium penalty
+        "inactive": 3.0,    # Larger penalty
     }
 
     candidates = []
     for s in eligible:
-        # Estimate waiting time based on queue and cores
+        # Estimate waiting time
         if s["cores"] > 0:
             queue_time = (s["waiting"] + s["running"]) * est_runtime / s["cores"]
         else:
-            queue_time = 1000000  # Large penalty if no cores (shouldn't happen)
+            queue_time = 1000000
         
-        penalty = state_penalty.get(s["state"].lower(), 20)
+        penalty = state_penalty.get(s["state"].lower(), 5.0) * est_runtime
         
-        # Total score = queue_time + state_penalty
-        total_score = queue_time + penalty
+        # Prefer better core fit (higher utilization)
+        utilization_factor = (s["cores"] - need_c) / s["cores"] if s["cores"] > 0 else 1.0
+        
+        # Balanced score
+        total_score = (queue_time + penalty) * (1 + 0.3 * utilization_factor)
         
         candidates.append((total_score, s))
 
-    # Sort by total_score (lower is better), then prefer more cores for parallelism
+    # Sort for best overall performance
     candidates.sort(key=lambda x: (
-        x[0],                        # Total score
-        -x[1]["cores"],              # More cores (for parallel execution)
+        x[0],                        # Balanced score
+        -x[1]["cores"],              # More cores
         x[1]["waiting"],             # Fewer waiting jobs
-        x[1]["id"],                  # Lower server ID
+        x[1]["id"],                  # Lower ID
     ))
 
     return candidates[0][1]
@@ -161,11 +156,10 @@ def main():
                 if "." in endmsg:
                     break
 
-            # Choose server with optimized heuristic
+            # Choose server
             selected = choose_server_optimized(servers, req_cores, req_mem, req_disk, est_runtime)
 
             if selected is None:
-                # fallback: just take first server in list
                 f = servers[0]
                 send(sock, f"SCHD {job_id} {f['type']} {f['id']}\n")
                 receive(sock)
