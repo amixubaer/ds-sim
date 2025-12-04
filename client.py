@@ -6,34 +6,39 @@ PORT = 50000
 USER = "ABC"
 
 def send(sock, msg):
-    if not msg.endswith("\n"):
-        msg += "\n"
     sock.sendall(msg.encode("ascii"))
 
-def recv_line(sock):
-    data = b""
-    while not data.endswith(b"\n"):
-        chunk = sock.recv(1)
-        if not chunk:
-            break
-        data += chunk
-    return data.decode("ascii", errors="ignore").strip()
+def receive(sock, timeout=2):
+    sock.settimeout(timeout)
+    try:
+        data = sock.recv(8192)
+        if not data:
+            return ""
+        return data.decode("ascii", errors="ignore").strip()
+    except:
+        return ""
 
 def parse_server(line):
     parts = line.split()
-    if len(parts) < 8:
-        return None
-    return {
+    s = {
         "type": parts[0],
         "id": int(parts[1]),
         "state": parts[2],
         "cores": int(parts[4]),
         "memory": int(parts[5]),
         "disk": int(parts[6]),
-        "waiting": int(parts[7])
+        "waiting": 0,
+        "running": 0,
     }
+    if len(parts) >= 9:
+        try:
+            s["waiting"] = int(parts[7])
+            s["running"] = int(parts[8])
+        except:
+            pass
+    return s
 
-def choose_server_optimized(servers, need_c, need_m, need_d):
+def choose_server(servers, need_c, need_m, need_d, est_runtime):
     eligible = []
     for s in servers:
         if s["cores"] >= need_c and s["memory"] >= need_m and s["disk"] >= need_d:
@@ -42,96 +47,106 @@ def choose_server_optimized(servers, need_c, need_m, need_d):
     if not eligible:
         return None
 
+    state_weight = {
+        "active": 1.0,
+        "idle": 1.2,
+        "booting": 2.5,
+        "inactive": 50.0,
+    }
+
     candidates = []
     for s in eligible:
-        core_util = need_c / s["cores"] if s["cores"] > 0 else 0
-        queue_impact = s["waiting"] * 100
-        state_impact = {"active": 0, "idle": 50, "booting": 150, "inactive": 300}.get(s["state"], 500)
-        total_score = (
-            (1 - core_util) * 40 +
-            queue_impact * 0.4 +
-            state_impact * 0.2
-        )
-        candidates.append((total_score, s))
+        queue = s["waiting"] + s["running"]
+        eff_cores = max(1, s["cores"])
+        base_ect = (queue + 1) * max(est_runtime, 1) / eff_cores
+        penalty = state_weight.get(s["state"].lower(), 3.0)
+        ect = base_ect * penalty
+        candidates.append((ect, queue, s))
 
-    candidates.sort(key=lambda s: (
-        s[0],
-        s[1]["waiting"],
-        -s[1]["cores"],
-        s[1]["id"],
-    ))
-    return candidates[0][1]
+    candidates.sort(
+        key=lambda x: (
+            x[0],
+            x[1],
+            -x[2]["cores"],
+            -x[2]["memory"],
+            x[2]["id"],
+        )
+    )
+    return candidates[0][2]
 
 def main():
     try:
-        sock = socket.create_connection((HOST, PORT), timeout=5)
-    except Exception:
+        sock = socket.create_connection((HOST, PORT), timeout=1)
+    except:
         return
 
-    send(sock, "HELO")
-    if recv_line(sock) != "OK":
+    send(sock, "HELO\n")
+    if receive(sock) != "OK":
         sock.close()
         return
 
-    send(sock, f"AUTH {USER}")
-    if recv_line(sock) != "OK":
+    send(sock, f"AUTH {USER}\n")
+    if receive(sock) != "OK":
         sock.close()
         return
 
     while True:
-        send(sock, "REDY")
-        msg = recv_line(sock)
+        send(sock, "REDY\n")
+        msg = receive(sock)
 
         if not msg:
             break
 
         if msg == "NONE":
-            send(sock, "QUIT")
-            recv_line(sock)
+            send(sock, "QUIT\n")
+            receive(sock)
             break
 
-        parts = msg.split()
-
-        if parts[0] in ("JOBN", "JOBP") and len(parts) >= 7:
+        if msg.startswith("JOBN") or msg.startswith("JOBP"):
+            parts = msg.split()
             job_id = parts[1]
-            req_cores = int(parts[3])
-            req_mem = int(parts[4])
-            req_disk = int(parts[5])
+            req_c = int(parts[3])
+            req_m = int(parts[4])
+            req_d = int(parts[5])
+            est_runtime = int(parts[6])
 
-            send(sock, f"GETS Capable {req_cores} {req_mem} {req_disk}")
-            header = recv_line(sock)
+            send(sock, f"GETS Capable {req_c} {req_m} {req_d}\n")
+            header = receive(sock)
 
             if not header.startswith("DATA"):
                 continue
 
             count = int(header.split()[1])
-            send(sock, "OK")
+            send(sock, "OK\n")
 
             servers = []
-            for _ in range(count):
-                line = recv_line(sock)
-                server = parse_server(line)
-                if server:
-                    servers.append(server)
+            while len(servers) < count:
+                chunk = receive(sock)
+                if not chunk:
+                    break
+                for line in chunk.split("\n"):
+                    if line.strip():
+                        servers.append(parse_server(line))
+                        if len(servers) == count:
+                            break
 
-            send(sock, "OK")
+            send(sock, "OK\n")
 
-            while recv_line(sock) != ".":
-                pass
+            while True:
+                if "." in receive(sock):
+                    break
 
-            selected = choose_server_optimized(servers, req_cores, req_mem, req_disk)
-            if selected is None and servers:
+            selected = choose_server(servers, req_c, req_m, req_d, est_runtime)
+            if selected is None:
                 selected = servers[0]
 
-            if selected:
-                send(sock, f"SCHD {job_id} {selected['type']} {selected['id']}")
-                recv_line(sock)
+            send(sock, f"SCHD {job_id} {selected['type']} {selected['id']}\n")
+            receive(sock)
 
-        elif parts[0] == "CHKQ":
-            send(sock, "OK")
-            recv_line(sock)
-            send(sock, "QUIT")
-            recv_line(sock)
+        elif msg.startswith("CHKQ"):
+            send(sock, "OK\n")
+            receive(sock)
+            send(sock, "QUIT\n")
             break
 
     sock.close()
