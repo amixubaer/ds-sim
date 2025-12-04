@@ -48,13 +48,18 @@ def choose_server(servers, need_c, need_m, need_d, est_runtime):
     if not eligible:
         return None
 
-    candidates = []
-    for s in eligible:
-        queue_len = s["waiting"] + s["running"]
-        candidates.append((queue_len, -s["cores"], s["id"], s))
+    active_pool = [s for s in eligible if s["state"].lower() in ("active", "idle")]
+    pool = active_pool if active_pool else eligible
 
-    candidates.sort(key=lambda x: (x[0], x[1], x[2]))
-    return candidates[0][3]
+    candidates = []
+    for s in pool:
+        queue = s["waiting"] + s["running"]
+        eff_cores = max(1, s["cores"])
+        ect = (queue + 1) * max(est_runtime, 1) / eff_cores
+        candidates.append((ect, queue, -s["cores"], s["id"], s))
+
+    candidates.sort(key=lambda x: (x[0], x[1], x[2], x[3]))
+    return candidates[0][4]
 
 def main():
     try:
