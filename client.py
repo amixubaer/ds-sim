@@ -20,7 +20,7 @@ def receive(sock, timeout=2):
 
 def parse_server(line):
     parts = line.split()
-    s = {
+    return {
         "type": parts[0],
         "id": int(parts[1]),
         "state": parts[2],
@@ -28,7 +28,6 @@ def parse_server(line):
         "memory": int(parts[5]),
         "disk": int(parts[6]),
     }
-    return s
 
 def get_all_servers(sock):
     send(sock, "GETS All\n")
@@ -95,8 +94,8 @@ def main():
         sock.close()
         return
 
-    all_servers = get_all_servers(sock)
-    largest_type, largest_ids = find_largest_type(all_servers)
+    largest_type = None
+    largest_ids = []
     rr_index = 0
 
     while True:
@@ -113,6 +112,13 @@ def main():
         if msg.startswith("JOBN") or msg.startswith("JOBP"):
             parts = msg.split()
             job_id = parts[1]
+            req_cores = int(parts[3])
+            req_mem = int(parts[4])
+            req_disk = int(parts[5])
+
+            if largest_type is None or not largest_ids:
+                all_servers = get_all_servers(sock)
+                largest_type, largest_ids = find_largest_type(all_servers)
 
             if largest_type and largest_ids:
                 target_id = largest_ids[rr_index % len(largest_ids)]
@@ -120,16 +126,10 @@ def main():
                 send(sock, f"SCHD {job_id} {largest_type} {target_id}\n")
                 receive(sock)
             else:
-                # fallback: use GETS Capable for safety if largest_type not available
-                req_cores = int(parts[3])
-                req_mem = int(parts[4])
-                req_disk = int(parts[5])
-
                 send(sock, f"GETS Capable {req_cores} {req_mem} {req_disk}\n")
                 header = receive(sock)
                 if not header.startswith("DATA"):
                     continue
-
                 count = int(header.split()[1])
                 send(sock, "OK\n")
 
