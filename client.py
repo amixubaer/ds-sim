@@ -43,6 +43,17 @@ def parse_server(line):
     return s
 
 
+def state_priority(st):
+    st = st.lower()
+    if st == "active":
+        return 0
+    if st == "idle":
+        return 1
+    if st == "booting":
+        return 2
+    return 3
+
+
 def choose_server(servers, need_c, need_m, need_d, est_runtime):
     eligible = []
     for s in servers:
@@ -52,37 +63,15 @@ def choose_server(servers, need_c, need_m, need_d, est_runtime):
     if not eligible:
         return None
 
-    def state_priority(st):
-        st = st.lower()
-        if st == "active":
-            return 0
-        if st == "idle":
-            return 1
-        if st == "booting":
-            return 2
-        return 3
-
-    short_job = est_runtime <= 200
-
-    if short_job:
-        eligible.sort(
-            key=lambda s: (
-                state_priority(s["state"]),
-                s["waiting"] + s["running"],
-                -s["cores"],
-                s["id"],
-            )
+    eligible.sort(
+        key=lambda s: (
+            state_priority(s["state"]),
+            s["waiting"] + s["running"],        # shortest queue
+            abs(s["cores"] - need_c),           # best-fit cores
+            -s["memory"],                       # more memory
+            s["id"],                            # stable tie-break
         )
-    else:
-        eligible.sort(
-            key=lambda s: (
-                state_priority(s["state"]),
-                s["waiting"] + s["running"],
-                -s["cores"],
-                -s["memory"],
-                s["id"],
-            )
-        )
+    )
 
     return eligible[0]
 
