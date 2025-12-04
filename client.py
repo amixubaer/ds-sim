@@ -1,151 +1,225 @@
 #!/usr/bin/env python3
 import socket
-import sys
 
 HOST = "127.0.0.1"
 PORT = 50000
-USER = "JUBAER"
-BUF = 4096
-TIMEOUT = 5.0
+USER = "ABC"
+
+# ---------------------------------------------------------
+# Basic network helpers (UNCHANGED PROTOCOL)
+# ---------------------------------------------------------
 
 def send(sock, msg):
-    if not msg.endswith("\n"):
-        msg += "\n"
-    sock.sendall(msg.encode())
+    sock.sendall(msg.encode("ascii"))
 
-def recv_line(sock):
-    data = bytearray()
-    sock.settimeout(TIMEOUT)
+def receive(sock, timeout=2):
+    sock.settimeout(timeout)
     try:
-        while True:
-            part = sock.recv(BUF)
-            if not part:
-                break
-            data.extend(part)
-            if b"\n" in part:
-                break
-    except (socket.timeout, OSError):
-        pass
-    return data.decode(errors="ignore").strip()
+        data = sock.recv(8192)
+        if not data:
+            return ""
+        return data.decode("ascii", errors="ignore").strip()
+    except:
+        return ""
+
+
+# ---------------------------------------------------------
+# Server parsing & selection (OPTIMISED)
+# ---------------------------------------------------------
 
 def parse_server(line):
-    p = line.split()
-    if len(p) < 7:
-        return None
-    waiting = 0
-    if len(p) > 7:
+    """
+    Expected format from ds-server (brief mode):
+      type id state curStartTime cores memory disk wJobs rJobs [cost ...]
+
+    We keep everything you used before, and ALSO read rJobs.
+    """
+    parts = line.split()
+    s = {
+        "type": parts[0],
+        "id": int(parts[1]),
+        "state": parts[2],
+        "cores": int(parts[4]),
+        "memory": int(parts[5]),
+        "disk": int(parts[6]),
+        "waiting": 0,
+        "running": 0,
+    }
+    if len(parts) >= 9:
         try:
-            waiting = int(p[7])
-        except Exception:
-            waiting = 0
-    return {
-        "type": p[0],
-        "id": int(p[1]),
-        "state": p[2],
-        "cores": int(p[4]),
-        "mem": int(p[5]),
-        "disk": int(p[6]),
-        "waiting": waiting
+            s["waiting"] = int(parts[7])
+            s["running"] = int(parts[8])
+        except ValueError:
+            s["waiting"] = 0
+            s["running"] = 0
+    return s
+
+
+def choose_server(servers, need_c, need_m, need_d, est_runtime):
+    """
+    Turnaround-focused heuristic (ECT-style), now state-aware:
+
+    1. Filter servers that can run the job (capacity constraint).
+    2. For each eligible server, compute a rough Estimated Completion Time (ECT):
+         queue_size = waiting + running
+         effective_cores = max(1, cores)
+         base_ect = (queue_size + 1) * est_runtime / effective_cores
+         state penalty: active < idle < booting << inactive
+    3. Pick the server with minimal (ECT * state_penalty), tie-breaking by:
+         - smaller queue_size
+         - more cores
+         - more memory
+         - smaller id
+    """
+
+    # Capacity filter
+    eligible = []
+    for s in servers:
+        if s["cores"] >= need_c and s["memory"] >= need_m and s["disk"] >= need_d:
+            eligible.append(s)
+
+    if not eligible:
+        return None
+
+    # State weights: penalise non-active servers to improve turnaround
+    state_weight = {
+        "active": 1.0,
+        "idle": 1.2,
+        "booting": 2.5,
+        "inactive": 50.0,   # basically avoid unless nothing else exists
     }
 
-def choose_atl(servers, need_c, need_m, need_d):
-    state_rank = {"active": 0, "idle": 1, "booting": 2, "inactive": 3}
-    best = None
-    for s in servers:
-        if s["cores"] >= need_c and s["mem"] >= need_m and s["disk"] >= need_d:
-            if best is None:
-                best = s
-                continue
-            if s["cores"] > best["cores"]:
-                best = s
-            elif s["cores"] == best["cores"]:
-                if state_rank.get(s["state"], 99) < state_rank.get(best["state"], 99):
-                    best = s
-                elif state_rank.get(s["state"], 99) == state_rank.get(best["state"], 99):
-                    if s["id"] < best["id"]:
-                        best = s
-    return best
+    candidates = []
+    for s in eligible:
+        queue_size = s["waiting"] + s["running"]
+        eff_cores = max(1, s["cores"])
+
+        # base ECT: more jobs and fewer cores -> larger time
+        base_ect = (queue_size + 1) * max(est_runtime, 1) / eff_cores
+
+        # state-aware penalty
+        penalty = state_weight.get(s["state"].lower(), 3.0)
+        ect = base_ect * penalty
+
+        candidates.append((ect, queue_size, s))
+
+    # Sort by ECT, then queue length, then cores/mem/id
+    candidates.sort(
+        key=lambda x: (
+            x[0],                        # ECT (lower is better)
+            x[1],                        # smaller queue
+            -x[2]["cores"],              # more cores
+            -x[2]["memory"],             # more memory
+            x[2]["id"],                  # lower id
+        )
+    )
+
+    # Best candidate server
+    return candidates[0][2]
+
+# ---------------------------------------------------------
+# Main DS-Sim Client Logic (protocol SAME, heuristic NEW)
+# ---------------------------------------------------------
 
 def main():
     try:
-        sock = socket.create_connection((HOST, PORT), timeout=TIMEOUT)
-    except Exception:
+        sock = socket.create_connection((HOST, PORT), timeout=1)
+    except:
         return
 
-    _ = recv_line(sock)
-
-    send(sock, "HELO")
-    if recv_line(sock) != "OK":
+    # Handshake 
+    send(sock, "HELO\n")
+    if receive(sock) != "OK":
         sock.close()
         return
 
-    send(sock, f"AUTH {USER}")
-    if recv_line(sock) != "OK":
+    send(sock, f"AUTH {USER}\n")
+    if receive(sock) != "OK":
         sock.close()
         return
 
+    # Main event loop
     while True:
-        send(sock, "REDY")
-        msg = recv_line(sock)
+        send(sock, "REDY\n")
+        msg = receive(sock)
+
         if not msg:
             break
+
+        # Simulator finishes
         if msg == "NONE":
-            send(sock, "QUIT")
-            _ = recv_line(sock)
+            send(sock, "QUIT\n")
+            receive(sock)
             break
-        if msg.startswith(("JCPL", "RESF", "RESR")):
-            continue
-        if msg.startswith(("JOBN", "JOBP")):
+
+        # Normal job event
+        if msg.startswith("JOBN") or msg.startswith("JOBP"):
             parts = msg.split()
-            if len(parts) < 7:
-                continue
             job_id = parts[1]
-            need_c = int(parts[3])
-            need_m = int(parts[4])
-            need_d = int(parts[5])
+            req_cores = int(parts[3])
+            req_mem = int(parts[4])
+            req_disk = int(parts[5])
+            est_runtime = int(parts[6])
 
-            send(sock, f"GETS Capable {need_c} {need_m} {need_d}")
-            header = recv_line(sock)
-            if not header or not header.startswith("DATA"):
-                continue
-            try:
-                n = int(header.split()[1])
-            except Exception:
+            # Request capable servers
+            send(sock, f"GETS Capable {req_cores} {req_mem} {req_disk}\n")
+            header = receive(sock)
+
+            if not header.startswith("DATA"):
                 continue
 
-            send(sock, "OK")
+            count = int(header.split()[1])
+
+            # First OK
+            send(sock, "OK\n")
+
+            # Read N server lines
             servers = []
-            for _ in range(n):
-                line = recv_line(sock)
-                if not line:
+            while len(servers) < count:
+                chunk = receive(sock)
+                if not chunk:
                     break
-                rec = parse_server(line)
-                if rec:
-                    servers.append(rec)
+                for line in chunk.split("\n"):
+                    line = line.strip()
+                    if line:
+                        servers.append(parse_server(line))
+                        if len(servers) == count:
+                            break
 
-            send(sock, "OK")
-            # consume terminating "."
+            # Second OK
+            send(sock, "OK\n")
+
+            # Wait for "."
             while True:
-                t = recv_line(sock)
-                if t == "." or t == "":
+                endmsg = receive(sock)
+                if "." in endmsg:
                     break
 
-            selected = choose_atl(servers, need_c, need_m, need_d)
-            if selected is None and servers:
-                selected = servers[0]
+            # Choose server with ECT-based heuristic
+            selected = choose_server(servers, req_cores, req_mem, req_disk, est_runtime)
 
-            if selected:
-                send(sock, f"SCHD {job_id} {selected['type']} {selected['id']}")
-                _ = recv_line(sock)
+            if selected is None:
+                # fallback: just take first server in list
+                f = servers[0]
+                send(sock, f"SCHD {job_id} {f['type']} {f['id']}\n")
+                receive(sock)
+            else:
+                send(sock, f"SCHD {job_id} {selected['type']} {selected['id']}\n")
+                receive(sock)
 
+        # Protocol check handling
         elif msg.startswith("CHKQ"):
-            send(sock, "OK")
-            _ = recv_line(sock)
-            send(sock, "QUIT")
-            _ = recv_line(sock)
+            send(sock, "OK\n")
+            receive(sock)
+            send(sock, "QUIT\n")
             break
+
+        # Completed job / other events → ignore and continue
+        else:
+            continue
 
     sock.close()
+
 
 if __name__ == "__main__":
     main()
