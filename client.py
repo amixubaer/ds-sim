@@ -88,15 +88,34 @@ def choose_server(servers, need_c, need_m, need_d, est_runtime):
     if not eligible:
         return None
 
+    heavy_job = est_runtime > 2000 or need_c >= 8
+
     candidates = []
     for s in eligible:
         queue = s["waiting"] + s["running"]
-        cores = max(1, s["cores"])
-        ect = (queue + 1) * max(est_runtime, 1) / cores
-        candidates.append((ect, queue, -s["cores"], -s["memory"], s["id"], s))
+        slack = s["cores"] - need_c
 
-    candidates.sort(key=lambda x: (x[0], x[1], x[2], x[3], x[4]))
-    return candidates[0][5]
+        if heavy_job:
+            # Long/heavy jobs → favour more cores, but still avoid long queues
+            score = (
+                queue,           # primary: smallest queue
+                -s["cores"],     # then: more cores
+                slack,           # then: tighter fit
+                s["id"],         # stable tie-break
+            )
+        else:
+            # Short/light jobs → best-fit on cores with queue awareness
+            score = (
+                queue,           # primary: smallest queue
+                slack,           # then: smallest slack (best fit)
+                s["type"],       # then: type name (stable)
+                s["id"],         # then: id
+            )
+
+        candidates.append((score, s))
+
+    candidates.sort(key=lambda x: x[0])
+    return candidates[0][1]
 
 
 def main():
