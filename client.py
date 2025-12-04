@@ -4,11 +4,12 @@ import socket
 HOST = "127.0.0.1"
 PORT = 50000
 USER = "ABC"
-
 BUF_SIZE = 8192
+
 
 def send(sock, msg: str):
     sock.sendall(msg.encode("ascii"))
+
 
 def receive(sock, timeout=2) -> str:
     sock.settimeout(timeout)
@@ -19,6 +20,7 @@ def receive(sock, timeout=2) -> str:
         return data.decode("ascii", errors="ignore").strip()
     except:
         return ""
+
 
 def parse_server(line: str):
     parts = line.split()
@@ -41,8 +43,9 @@ def parse_server(line: str):
             s["running"] = 0
     return s
 
-def get_servers(sock, qtype: str, need_c: int, need_m: int, need_d: int):
-    send(sock, f"GETS {qtype} {need_c} {need_m} {need_d}\n")
+
+def get_capable_servers(sock, need_c: int, need_m: int, need_d: int):
+    send(sock, f"GETS Capable {need_c} {need_m} {need_d}\n")
     header = receive(sock)
     if not header.startswith("DATA"):
         return []
@@ -75,38 +78,26 @@ def get_servers(sock, qtype: str, need_c: int, need_m: int, need_d: int):
 
     return servers
 
+
 def choose_server(servers, need_c, need_m, need_d, est_runtime):
     eligible = []
     for s in servers:
         if s["cores"] >= need_c and s["memory"] >= need_m and s["disk"] >= need_d:
             eligible.append(s)
+
     if not eligible:
         return None
 
-    short_job = est_runtime <= 500
+    candidates = []
+    for s in eligible:
+        queue = s["waiting"] + s["running"]
+        cores = max(1, s["cores"])
+        ect = (queue + 1) * max(est_runtime, 1) / cores
+        candidates.append((ect, queue, -s["cores"], -s["memory"], s["id"], s))
 
-    if short_job:
-        # Prefer low-queue, just-big-enough servers for short jobs
-        eligible.sort(
-            key=lambda s: (
-                s["waiting"] + s["running"],  # smaller queue
-                s["cores"],                  # fewer cores (best fit)
-                s["memory"],
-                s["id"],
-            )
-        )
-    else:
-        # Long jobs: favour bigger servers but avoid huge queues
-        eligible.sort(
-            key=lambda s: (
-                s["waiting"] + s["running"],  # still keep queue small
-                -s["cores"],                  # more cores
-                -s["memory"],
-                s["id"],
-            )
-        )
+    candidates.sort(key=lambda x: (x[0], x[1], x[2], x[3], x[4]))
+    return candidates[0][5]
 
-    return eligible[0]
 
 def main():
     try:
@@ -144,15 +135,8 @@ def main():
             req_disk = int(parts[5])
             est_runtime = int(parts[6])
 
-            # First try servers that can run the job immediately
-            servers = get_servers(sock, "Avail", req_cores, req_mem, req_disk)
+            servers = get_capable_servers(sock, req_cores, req_mem, req_disk)
             if not servers:
-                # Fallback to all capable servers
-                servers = get_servers(sock, "Capable", req_cores, req_mem, req_disk)
-
-            if not servers:
-                # Should not happen, but just in case
-                send(sock, "REDY\n")
                 continue
 
             selected = choose_server(servers, req_cores, req_mem, req_disk, est_runtime)
@@ -172,6 +156,7 @@ def main():
             continue
 
     sock.close()
+
 
 if __name__ == "__main__":
     main()
