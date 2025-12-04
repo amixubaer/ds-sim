@@ -24,7 +24,7 @@ def receive(sock, timeout=2):
 
 
 # ---------------------------------------------------------
-# Server parsing & selection (ATL-style)
+# Server parsing & selection (QUEUE-AWARE HEURISTIC)
 # ---------------------------------------------------------
 
 def parse_server(line):
@@ -55,26 +55,40 @@ def parse_server(line):
 
 def choose_server(servers, need_c, need_m, need_d, est_runtime):
     """
-    ATL-style heuristic:
-    - Among *capable* servers, pick the one with the most cores.
-    - Tie-break by lower server ID.
-    - Ignore waiting/running/state (pure allocate-to-largest behaviour).
+    Queue-aware heuristic:
+
+    1. Filter servers that can run the job (cores, memory, disk).
+    2. For each eligible server, compute queue_size = waiting + running.
+    3. Pick the server with:
+         - smallest queue_size (better turnaround)
+         - tie-break: more cores
+         - then more memory
+         - then lower id
     """
 
-    best = None
+    eligible = []
     for s in servers:
         if s["cores"] >= need_c and s["memory"] >= need_m and s["disk"] >= need_d:
-            if best is None:
-                best = s
-            else:
-                if s["cores"] > best["cores"]:
-                    best = s
-                elif s["cores"] == best["cores"] and s["id"] < best["id"]:
-                    best = s
+            eligible.append(s)
+
+    if not eligible:
+        return None
+
+    def score(s):
+        queue_size = s["waiting"] + s["running"]
+        # We minimise: first queue_size, then negative cores/memory, then id
+        return (
+            queue_size,
+            -s["cores"],
+            -s["memory"],
+            s["id"],
+        )
+
+    best = min(eligible, key=score)
     return best
 
 # ---------------------------------------------------------
-# Main DS-Sim Client Logic (protocol SAME, heuristic = ATL)
+# Main DS-Sim Client Logic
 # ---------------------------------------------------------
 
 def main():
@@ -151,15 +165,15 @@ def main():
                 if "." in endmsg:
                     break
 
-            # Choose server with ATL-style heuristic
+            # Choose server with queue-aware heuristic
             selected = choose_server(servers, req_cores, req_mem, req_disk, est_runtime)
 
-            if selected is None:
+            if selected is None and servers:
                 # fallback: just take first server in list
                 f = servers[0]
                 send(sock, f"SCHD {job_id} {f['type']} {f['id']}\n")
                 receive(sock)
-            else:
+            elif selected:
                 send(sock, f"SCHD {job_id} {selected['type']} {selected['id']}\n")
                 receive(sock)
 
