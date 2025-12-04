@@ -40,7 +40,7 @@ def parse_server(line):
             pass
     return s
 
-def choose_server(servers, need_c, need_m, need_d, est_runtime, load_map):
+def choose_server(servers, need_c, need_m, need_d, est_runtime):
     eligible = []
     for s in servers:
         if s["cores"] >= need_c and s["memory"] >= need_m and s["disk"] >= need_d:
@@ -48,36 +48,13 @@ def choose_server(servers, need_c, need_m, need_d, est_runtime, load_map):
     if not eligible:
         return None
 
-    est_runtime = max(1, est_runtime)
     candidates = []
-
     for s in eligible:
-        key = (s["type"], s["id"])
-        base_load = load_map.get(key, 0.0)
-        eff_cores = max(1, s["cores"])
-        queue_jobs = s["waiting"] + s["running"]
+        queue_len = s["waiting"] + s["running"]
+        candidates.append((queue_len, -s["cores"], s["id"], s))
 
-        queue_term = queue_jobs * est_runtime / eff_cores
-        my_term = est_runtime / eff_cores
-
-        state = s["state"].lower()
-        if state == "active":
-            weight = 1.0
-        elif state == "idle":
-            weight = 0.9
-        elif state == "booting":
-            weight = 1.3
-        else:
-            weight = 5.0
-
-        score = (base_load + queue_term + my_term) * weight
-        fit_penalty = abs(s["cores"] - need_c) * 0.05
-        score += fit_penalty
-
-        candidates.append((score, queue_jobs, -s["cores"], -s["memory"], s["id"], s))
-
-    candidates.sort(key=lambda x: (x[0], x[1], x[2], x[3], x[4]))
-    return candidates[0][5]
+    candidates.sort(key=lambda x: (x[0], x[1], x[2]))
+    return candidates[0][3]
 
 def main():
     try:
@@ -94,8 +71,6 @@ def main():
     if receive(sock) != "OK":
         sock.close()
         return
-
-    load_map = {}
 
     while True:
         send(sock, "REDY")
@@ -144,25 +119,12 @@ def main():
                 if "." in endmsg:
                     break
 
-            selected = choose_server(servers, req_cores, req_mem, req_disk, est_runtime, load_map)
+            selected = choose_server(servers, req_cores, req_mem, req_disk, est_runtime)
             if selected is None:
                 selected = servers[0]
 
-            key = (selected["type"], selected["id"])
-            eff_cores = max(1, selected["cores"])
-            load_map[key] = load_map.get(key, 0.0) + est_runtime / eff_cores
-
             send(sock, f"SCHD {job_id} {selected['type']} {selected['id']}")
             receive(sock)
-
-        elif msg.startswith("JCPL"):
-            parts = msg.split()
-            if len(parts) >= 4:
-                stype = parts[-2]
-                sid = int(parts[-1])
-                key = (stype, sid)
-                if key in load_map:
-                    load_map[key] = max(0.0, load_map[key] * 0.5)
 
         elif msg.startswith("CHKQ"):
             send(sock, "OK")
