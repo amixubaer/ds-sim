@@ -5,10 +5,10 @@ HOST = "127.0.0.1"
 PORT = 50000
 USER = "ABC"
 
+
 def send(sock, msg):
-    if not msg.endswith("\n"):
-        msg += "\n"
     sock.sendall(msg.encode("ascii"))
+
 
 def receive(sock, timeout=2):
     sock.settimeout(timeout)
@@ -20,15 +20,16 @@ def receive(sock, timeout=2):
     except:
         return ""
 
+
 def parse_server(line):
     parts = line.split()
     s = {
-        "type":   parts[0],
-        "id":     int(parts[1]),
-        "state":  parts[2],
-        "cores":  int(parts[4]),
+        "type": parts[0],
+        "id": int(parts[1]),
+        "state": parts[2],
+        "cores": int(parts[4]),
         "memory": int(parts[5]),
-        "disk":   int(parts[6]),
+        "disk": int(parts[6]),
         "waiting": 0,
         "running": 0,
     }
@@ -37,29 +38,54 @@ def parse_server(line):
             s["waiting"] = int(parts[7])
             s["running"] = int(parts[8])
         except ValueError:
-            pass
+            s["waiting"] = 0
+            s["running"] = 0
     return s
+
 
 def choose_server(servers, need_c, need_m, need_d, est_runtime):
     eligible = []
     for s in servers:
         if s["cores"] >= need_c and s["memory"] >= need_m and s["disk"] >= need_d:
             eligible.append(s)
+
     if not eligible:
         return None
 
-    active_pool = [s for s in eligible if s["state"].lower() in ("active", "idle")]
-    pool = active_pool if active_pool else eligible
+    def state_priority(st):
+        st = st.lower()
+        if st == "active":
+            return 0
+        if st == "idle":
+            return 1
+        if st == "booting":
+            return 2
+        return 3
 
-    candidates = []
-    for s in pool:
-        queue = s["waiting"] + s["running"]
-        eff_cores = max(1, s["cores"])
-        ect = (queue + 1) * max(est_runtime, 1) / eff_cores
-        candidates.append((ect, queue, -s["cores"], s["id"], s))
+    short_job = est_runtime <= 200
 
-    candidates.sort(key=lambda x: (x[0], x[1], x[2], x[3]))
-    return candidates[0][4]
+    if short_job:
+        eligible.sort(
+            key=lambda s: (
+                state_priority(s["state"]),
+                s["waiting"] + s["running"],
+                -s["cores"],
+                s["id"],
+            )
+        )
+    else:
+        eligible.sort(
+            key=lambda s: (
+                state_priority(s["state"]),
+                s["waiting"] + s["running"],
+                -s["cores"],
+                -s["memory"],
+                s["id"],
+            )
+        )
+
+    return eligible[0]
+
 
 def main():
     try:
@@ -67,25 +93,25 @@ def main():
     except:
         return
 
-    send(sock, "HELO")
+    send(sock, "HELO\n")
     if receive(sock) != "OK":
         sock.close()
         return
 
-    send(sock, f"AUTH {USER}")
+    send(sock, f"AUTH {USER}\n")
     if receive(sock) != "OK":
         sock.close()
         return
 
     while True:
-        send(sock, "REDY")
+        send(sock, "REDY\n")
         msg = receive(sock)
 
         if not msg:
             break
 
         if msg == "NONE":
-            send(sock, "QUIT")
+            send(sock, "QUIT\n")
             receive(sock)
             break
 
@@ -97,13 +123,14 @@ def main():
             req_disk = int(parts[5])
             est_runtime = int(parts[6])
 
-            send(sock, f"GETS Capable {req_cores} {req_mem} {req_disk}")
+            send(sock, f"GETS Capable {req_cores} {req_mem} {req_disk}\n")
             header = receive(sock)
+
             if not header.startswith("DATA"):
                 continue
 
             count = int(header.split()[1])
-            send(sock, "OK")
+            send(sock, "OK\n")
 
             servers = []
             while len(servers) < count:
@@ -112,36 +139,37 @@ def main():
                     break
                 for line in chunk.split("\n"):
                     line = line.strip()
-                    if not line or line == ".":
-                        continue
-                    servers.append(parse_server(line))
-                    if len(servers) == count:
-                        break
+                    if line:
+                        servers.append(parse_server(line))
+                        if len(servers) == count:
+                            break
 
-            send(sock, "OK")
+            send(sock, "OK\n")
+
             while True:
                 endmsg = receive(sock)
                 if "." in endmsg:
                     break
 
-            selected = choose_server(servers, req_cores, req_mem, req_disk, est_runtime)
-            if selected is None:
+            selected = choose_server(
+                servers, req_cores, req_mem, req_disk, est_runtime
+            )
+
+            if selected is None and servers:
                 selected = servers[0]
 
-            send(sock, f"SCHD {job_id} {selected['type']} {selected['id']}")
-            receive(sock)
+            if selected:
+                send(sock, f"SCHD {job_id} {selected['type']} {selected['id']}\n")
+                receive(sock)
 
         elif msg.startswith("CHKQ"):
-            send(sock, "OK")
+            send(sock, "OK\n")
             receive(sock)
-            send(sock, "QUIT")
-            receive(sock)
+            send(sock, "QUIT\n")
             break
 
-        else:
-            continue
-
     sock.close()
+
 
 if __name__ == "__main__":
     main()
