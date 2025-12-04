@@ -24,15 +24,13 @@ def receive(sock, timeout=2):
 
 
 # ---------------------------------------------------------
-# Server parsing & selection (OPTIMISED)
+# Server parsing & selection (ATL-style)
 # ---------------------------------------------------------
 
 def parse_server(line):
     """
     Expected format from ds-server (brief mode):
       type id state curStartTime cores memory disk wJobs rJobs [cost ...]
-
-    We keep everything you used before, and ALSO read rJobs.
     """
     parts = line.split()
     s = {
@@ -57,68 +55,26 @@ def parse_server(line):
 
 def choose_server(servers, need_c, need_m, need_d, est_runtime):
     """
-    Turnaround-focused heuristic (ECT-style), now state-aware:
-
-    1. Filter servers that can run the job (capacity constraint).
-    2. For each eligible server, compute a rough Estimated Completion Time (ECT):
-         queue_size = waiting + running
-         effective_cores = max(1, cores)
-         base_ect = (queue_size + 1) * est_runtime / effective_cores
-         state penalty: active < idle < booting << inactive
-    3. Pick the server with minimal (ECT * state_penalty), tie-breaking by:
-         - smaller queue_size
-         - more cores
-         - more memory
-         - smaller id
+    ATL-style heuristic:
+    - Among *capable* servers, pick the one with the most cores.
+    - Tie-break by lower server ID.
+    - Ignore waiting/running/state (pure allocate-to-largest behaviour).
     """
 
-    # Capacity filter
-    eligible = []
+    best = None
     for s in servers:
         if s["cores"] >= need_c and s["memory"] >= need_m and s["disk"] >= need_d:
-            eligible.append(s)
-
-    if not eligible:
-        return None
-
-    # State weights: penalise non-active servers to improve turnaround
-    state_weight = {
-        "active": 1.0,
-        "idle": 1.2,
-        "booting": 2.5,
-        "inactive": 50.0,   # basically avoid unless nothing else exists
-    }
-
-    candidates = []
-    for s in eligible:
-        queue_size = s["waiting"] + s["running"]
-        eff_cores = max(1, s["cores"])
-
-        # base ECT: more jobs and fewer cores -> larger time
-        base_ect = (queue_size + 1) * max(est_runtime, 1) / eff_cores
-
-        # state-aware penalty
-        penalty = state_weight.get(s["state"].lower(), 3.0)
-        ect = base_ect * penalty
-
-        candidates.append((ect, queue_size, s))
-
-    # Sort by ECT, then queue length, then cores/mem/id
-    candidates.sort(
-        key=lambda x: (
-            x[0],                        # ECT (lower is better)
-            x[1],                        # smaller queue
-            -x[2]["cores"],              # more cores
-            -x[2]["memory"],             # more memory
-            x[2]["id"],                  # lower id
-        )
-    )
-
-    # Best candidate server
-    return candidates[0][2]
+            if best is None:
+                best = s
+            else:
+                if s["cores"] > best["cores"]:
+                    best = s
+                elif s["cores"] == best["cores"] and s["id"] < best["id"]:
+                    best = s
+    return best
 
 # ---------------------------------------------------------
-# Main DS-Sim Client Logic (protocol SAME, heuristic NEW)
+# Main DS-Sim Client Logic (protocol SAME, heuristic = ATL)
 # ---------------------------------------------------------
 
 def main():
@@ -195,7 +151,7 @@ def main():
                 if "." in endmsg:
                     break
 
-            # Choose server with ECT-based heuristic
+            # Choose server with ATL-style heuristic
             selected = choose_server(servers, req_cores, req_mem, req_disk, est_runtime)
 
             if selected is None:
