@@ -89,31 +89,30 @@ def choose_server(servers, need_c, need_m, need_d, est_runtime):
 
     def state_rank(st):
         st = st.lower()
-        if st == "active": return 0
-        if st == "idle": return 1
-        if st == "booting": return 2
+        if st == "active":
+            return 0
+        if st == "idle":
+            return 1
+        if st == "booting":
+            return 2
         return 3
 
-    est_runtime = max(est_runtime, 1)
-    candidates = []
+    best = None
+    best_key = None
 
     for s in eligible:
         queue = s["waiting"] + s["running"]
-        eff = max(1, s["cores"])
-        ect = (queue + 1) * est_runtime / eff
-        score = (
-            state_rank(s["state"]),
+        key = (
             queue,
-            ect,
-            -s["cores"],
-            -s["memory"],
-            s["id"]
+            state_rank(s["state"]),
+            s["cores"],
+            s["id"],
         )
-        candidates.append((score, s))
+        if best is None or key < best_key:
+            best = s
+            best_key = key
 
-    candidates.sort(key=lambda x: x[0])
-    return candidates[0][1]
-
+    return best
 
 
 def main():
