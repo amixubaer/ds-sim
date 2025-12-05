@@ -1,227 +1,301 @@
-#!/usr/bin/env python3
 import socket
+import sys
+from typing import Dict, Any, List, Tuple
+from xml.etree import ElementTree
 
-HOST = "127.0.0.1"
-PORT = 50000
-USER = "ABC"
 BUF_SIZE = 8192
+DEFAULT_PORT = 50000
+HOST = "localhost"
+VERBOSE = False  # set True for debugging
 
 
-def send(sock, msg: str):
-    sock.sendall(msg.encode("ascii"))
+def debug(*args, **kwargs):
+    if VERBOSE:
+        print(*args, **kwargs, file=sys.stderr)
 
 
-def receive(sock, timeout=2) -> str:
-    sock.settimeout(timeout)
+def receive(sock: socket.socket) -> str:
+    """Receive a single ds-server message (which may contain multiple lines)."""
+    data = b""
+    while True:
+        try:
+            part = sock.recv(BUF_SIZE)
+        except (TimeoutError, socket.timeout):
+            break
+        if not part:
+            break
+        data += part
+        if len(part) < BUF_SIZE:
+            break
+    message = data.decode().strip()
+    if VERBOSE:
+        print("Received:", message, file=sys.stderr)
+    return message
+
+
+def send(sock: socket.socket, message: str):
+    if VERBOSE:
+        print("Sent:", message, file=sys.stderr)
+    sock.sendall((message + "\n").encode("utf-8"))
+
+
+def read_system_info(filename: str = "ds-system.xml") -> Dict[str, Dict[str, Any]]:
+    """
+    Read static server information produced by ds-server after AUTH.
+    We use this to know boot times and core counts for each server type.
+    """
+    info: Dict[str, Dict[str, Any]] = {}
     try:
-        data = sock.recv(BUF_SIZE)
-        if not data:
-            return ""
-        return data.decode("ascii", errors="ignore").strip()
-    except:
-        return ""
+        tree = ElementTree.parse(filename)
+    except Exception as e:
+        debug("Could not read ds-system.xml:", e)
+        return info
+
+    root = tree.getroot()
+    # ds-system.xml structure: <system><servers><server .../></servers></system>
+    for server in root.iter("server"):
+        s_type = server.attrib.get("type")
+        if not s_type:
+            continue
+
+        def _int(attr: str, default: int = 0) -> int:
+            val = server.attrib.get(attr)
+            try:
+                return int(val) if val is not None else default
+            except ValueError:
+                return default
+
+        def _float(attr: str, default: float = 0.0) -> float:
+            val = server.attrib.get(attr)
+            try:
+                return float(val) if val is not None else default
+            except ValueError:
+                return default
+
+        info[s_type] = {
+            "limit": _int("limit", 1),
+            "boot_time": _int("bootupTime", 0),
+            "hourly_rate": _float("hourlyRate", 0.0),
+            # some versions may use different attribute names
+            "cores": _int("coreCount", _int("cores", 1)),
+            "memory": _int("memory", 0),
+            "disk": _int("disk", 0),
+        }
+    debug("Loaded system info for types:", list(info.keys()))
+    return info
 
 
-def parse_server(line: str):
+def parse_server_record(line: str) -> Dict[str, Any]:
     parts = line.split()
-    s = {
+    record = {
         "type": parts[0],
         "id": int(parts[1]),
         "state": parts[2],
+        "curStartTime": int(parts[3]),
         "cores": int(parts[4]),
         "memory": int(parts[5]),
         "disk": int(parts[6]),
-        "waiting": 0,
-        "running": 0,
+        "wJobs": int(parts[7]),
+        "rJobs": int(parts[8]),
     }
-    if len(parts) >= 9:
-        try:
-            s["waiting"] = int(parts[7])
-            s["running"] = int(parts[8])
-        except ValueError:
-            s["waiting"] = 0
-            s["running"] = 0
-    return s
+    return record
 
 
-def get_capable_servers(sock, need_c: int, need_m: int, need_d: int):
-    send(sock, f"GETS Capable {need_c} {need_m} {need_d}\n")
+def get_capable_servers(sock: socket.socket, cores: int, mem: int, disk: int) -> List[Dict[str, Any]]:
+    """Issue GETS Capable and return a list of server records."""
+    send(sock, f"GETS Capable {cores} {mem} {disk}")
     header = receive(sock)
     if not header.startswith("DATA"):
+        debug("Unexpected header from GETS:", header)
         return []
+    _, n_recs_str, _ = header.split()
+    n_recs = int(n_recs_str)
 
-    tokens = header.split()
-    count = int(tokens[1])
-
-    send(sock, "OK\n")
-
-    servers = []
-    while len(servers) < count:
-        chunk = receive(sock)
-        if not chunk:
-            break
-        for line in chunk.split("\n"):
-            line = line.strip()
-            if line:
-                servers.append(parse_server(line))
-                if len(servers) == count:
-                    break
-
-    send(sock, "OK\n")
-
-    while True:
-        endmsg = receive(sock)
-        if not endmsg:
-            break
-        if endmsg == "." or endmsg.endswith("."):
-            break
-
+    send(sock, "OK")
+    data = receive(sock)
+    lines = data.splitlines()
+    servers: List[Dict[str, Any]] = []
+    for line in lines[:n_recs]:
+        if line.strip():
+            servers.append(parse_server_record(line))
+    send(sock, "OK")
+    _ = receive(sock)  # read the terminating '.'
     return servers
 
-STATE_RANK = {
-    "active": 0,
-    "booting": 1,
-    "idle": 2,
-    "inactive": 3,
-}
 
-WAIT_WEIGHT = 2.0
-RUN_WEIGHT = 0.8
+def query_ewjt(sock: socket.socket, s_type: str, s_id: int) -> int:
+    """Query EJWT for a server (total estimated waiting time of queued jobs)."""
+    send(sock, f"EJWT {s_type} {s_id}")
+    reply = receive(sock)
+    try:
+        return int(reply.strip())
+    except ValueError:
+        debug("Bad EJWT reply:", reply)
+        return 0
 
-BASE_PENALTY_BOOTING = 0.3
-BASE_PENALTY_IDLE = 0.5
 
-THRESH1 = 0.8
-THRESH2 = 1.2
-THRESH3 = 1.8
+def select_server_for_job(
+    sock: socket.socket,
+    job: Dict[str, int],
+    servers: List[Dict[str, Any]],
+    system_info: Dict[str, Dict[str, Any]],
+) -> Tuple[str, int]:
+    """
+    Scheduling heuristic: EQBF (Earliest-Queue Best-Fit)
 
-def can_run(server, need_c, need_m, need_d):
-    return (
-        server["cores"] >= need_c
-        and server["memory"] >= need_m
-        and server["disk"] >= need_d
-    )
+    1. Prefer servers that can run the job immediately and have no waiting jobs.
+       Among them, choose Best-Fit on available cores.
+    2. If none are immediately available, choose the server with the smallest
+       (EJWT + boot-penalty). Tie-break on smaller initial core count.
+    """
+    cores = job["cores"]
+    mem = job["memory"]
+    disk = job["disk"]
 
-def server_load(server):
-    base = server["waiting"] * WAIT_WEIGHT + server["running"] * RUN_WEIGHT
-    return base / server["cores"]
+    immediate: List[Tuple[int, int, str, int]] = []  # (leftover_cores, init_cores, type, id)
+    deferred: List[Tuple[str, int, Dict[str, Any]]] = []  # (type, id, record)
 
-def choose_server(servers, need_c, need_m, need_d, est_runtime):
-    candidates = []
-    for s in servers:
-        if can_run(s, need_c, need_m, need_d):
-            candidates.append(s)
-    if not candidates:
-        return None
+    for rec in servers:
+        s_type = rec["type"]
+        s_id = rec["id"]
+        state = rec["state"]
+        avail_cores = rec["cores"]
+        avail_mem = rec["memory"]
+        avail_disk = rec["disk"]
+        wJobs = rec["wJobs"]
 
-    active_loads = [
-        server_load(s) for s in candidates if s["state"] == "active"
-    ]
-    min_active_load = min(active_loads) if active_loads else None
-
-    best = None
-    best_key = None
-
-    for s in candidates:
-        load = server_load(s)
-        state = s["state"]
-
-        if state == "active":
-            state_penalty = 0.0
-        elif state in ("booting", "idle"):
-            if state == "booting":
-                base = BASE_PENALTY_BOOTING
-            else:
-                base = BASE_PENALTY_IDLE
-
-            if min_active_load is None or min_active_load > THRESH3:
-                factor = 0.3
-            elif min_active_load > THRESH2:
-                factor = 0.5
-            elif min_active_load > THRESH1:
-                factor = 0.8
-            else:
-                factor = 1.2
-
-            state_penalty = base * factor
-        else:
-            state_penalty = 2.0
-
-        load_score = load + state_penalty
-
-        key = (
-            load_score,
-            s["waiting"],
-            s["running"],
-            STATE_RANK.get(state, 3),
-            -s["cores"],
-            s["id"],
+        can_eventually_run = (
+            avail_cores >= cores and avail_mem >= mem and avail_disk >= disk
         )
 
-        if best_key is None or key < best_key:
-            best_key = key
-            best = s
+        sys_info = system_info.get(s_type, {})
+        init_cores = sys_info.get("cores", avail_cores)
 
-    return best
+        # Immediate: idle or active, no waiting jobs, and enough free resources
+        if state in ("idle", "active") and wJobs == 0 and can_eventually_run:
+            leftover = avail_cores - cores
+            immediate.append((leftover, init_cores, s_type, s_id))
+        else:
+            if can_eventually_run:
+                deferred.append((s_type, s_id, rec))
+
+    if immediate:
+        # Best-fit on leftover cores, then smaller initial cores
+        immediate.sort(key=lambda t: (t[0], t[1]))
+        _, _, best_type, best_id = immediate[0]
+        return best_type, best_id
+
+    # No server can take job immediately: look at queueing times using EJWT
+    best_choice = None  # (score, init_cores, type, id)
+    for s_type, s_id, rec in deferred:
+        sys_info = system_info.get(s_type, {})
+        init_cores = sys_info.get("cores", rec["cores"])
+        boot_time = sys_info.get("boot_time", 0)
+
+        wait_time = query_ewjt(sock, s_type, s_id)
+        penalty = 0
+        if rec["state"] == "inactive":
+            penalty += boot_time
+        elif rec["state"] == "booting":
+            # Rough approximation: half boot time remaining
+            penalty += boot_time // 2
+
+        score = wait_time + penalty
+
+        if best_choice is None or score < best_choice[0] or (
+            score == best_choice[0] and init_cores < best_choice[1]
+        ):
+            best_choice = (score, init_cores, s_type, s_id)
+
+    if best_choice is not None:
+        return best_choice[2], best_choice[3]
+
+    # Fallback: first capable server (should rarely happen)
+    first = servers[0]
+    return first["type"], first["id"]
 
 
+def parse_job_message(message: str) -> Dict[str, int]:
+    # JOBN jobID submitTime core memory disk estRuntime
+    parts = message.split()
+    return {
+        "id": int(parts[1]),
+        "submit": int(parts[2]),
+        "cores": int(parts[3]),
+        "memory": int(parts[4]),
+        "disk": int(parts[5]),
+        "est_runtime": int(parts[6]),
+    }
 
 
 def main():
-    try:
-        sock = socket.create_connection((HOST, PORT), timeout=1)
-    except:
-        return
+    # Optional: allow port override as first positional arg or -p PORT.
+    port = DEFAULT_PORT
+    args = sys.argv[1:]
+    if args:
+        # handle "-p 55555" or just "55555"
+        if args[0] == "-p" and len(args) >= 2:
+            try:
+                port = int(args[1])
+            except ValueError:
+                pass
+        else:
+            try:
+                port = int(args[0])
+            except ValueError:
+                pass
 
-    send(sock, "HELO\n")
-    if receive(sock) != "OK":
-        sock.close()
-        return
+    sock = socket.socket()
+    sock.settimeout(2)
+    sock.connect((HOST, port))
 
-    send(sock, f"AUTH {USER}\n")
-    if receive(sock) != "OK":
-        sock.close()
-        return
+    # Handshake
+    send(sock, "HELO")
+    _ = receive(sock)
+    # Can be replaced with student ID if needed
+    send(sock, "AUTH student")
+    _ = receive(sock)
+
+    # ds-server now writes ds-system.xml; read static server info
+    system_info = read_system_info()
+
+    # Start scheduling loop
+    send(sock, "REDY")
+    message = receive(sock)
 
     while True:
-        send(sock, "REDY\n")
-        msg = receive(sock)
-
-        if not msg:
+        if not message:
             break
 
-        if msg == "NONE":
-            send(sock, "QUIT\n")
-            receive(sock)
-            break
+        if message.startswith("JOBN") or message.startswith("JOBP"):
+            job = parse_job_message(message)
+            servers = get_capable_servers(sock, job["cores"], job["memory"], job["disk"])
 
-        if msg.startswith("JOBN") or msg.startswith("JOBP"):
-            parts = msg.split()
-            job_id = parts[1]
-            req_cores = int(parts[3])
-            req_mem = int(parts[4])
-            req_disk = int(parts[5])
-            est_runtime = int(parts[6])
-
-            servers = get_capable_servers(sock, req_cores, req_mem, req_disk)
             if not servers:
+                # Fallback: just ask again
+                send(sock, "REDY")
+                message = receive(sock)
                 continue
 
-            selected = choose_server(servers, req_cores, req_mem, req_disk, est_runtime)
-            if selected is None:
-                selected = servers[0]
+            s_type, s_id = select_server_for_job(sock, job, servers, system_info)
+            send(sock, f"SCHD {job['id']} {s_type} {s_id}")
+            _ = receive(sock)  # expect OK
 
-            send(sock, f"SCHD {job_id} {selected['type']} {selected['id']}\n")
-            receive(sock)
-
-        elif msg.startswith("CHKQ"):
-            send(sock, "OK\n")
-            receive(sock)
-            send(sock, "QUIT\n")
+        elif message.startswith("JCPL"):
+            # Job completed – we don't reschedule anything here, just continue.
+            pass
+        elif message.startswith("RESF") or message.startswith("RESR") or message.startswith("CHKQ"):
+            # Failure / recovery / queue messages – we ignore for now but keep protocol moving.
+            pass
+        elif message.startswith("NONE"):
+            # No more jobs: terminate
+            send(sock, "QUIT")
+            _ = receive(sock)  # QUIT back
             break
 
-        else:
-            continue
+        # Ask for next event
+        send(sock, "REDY")
+        message = receive(sock)
 
     sock.close()
 
