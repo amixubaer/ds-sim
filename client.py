@@ -78,43 +78,59 @@ def get_capable_servers(sock, need_c: int, need_m: int, need_d: int):
 
     return servers
 
+STATE_RANK = {
+    "active": 0,
+    "booting": 1,
+    "idle": 2,
+    "inactive": 3,
+}
+
+def can_run(server, need_c, need_m, need_d):
+    return (
+        server["cores"] >= need_c
+        and server["memory"] >= need_m
+        and server["disk"] >= need_d
+    )
 
 def choose_server(servers, need_c, need_m, need_d, est_runtime):
-    eligible = []
-    for s in servers:
-        if s["cores"] >= need_c and s["memory"] >= need_m and s["disk"] >= need_d:
-            eligible.append(s)
-    if not eligible:
-        return None
-
-    def state_rank(st):
-        st = st.lower()
-        if st == "active":
-            return 0
-        if st == "idle":
-            return 1
-        if st == "booting":
-            return 2
-        return 3
-
     best = None
     best_key = None
 
-    for s in eligible:
-        queue = s["waiting"] + s["running"]
-        load = queue / s["cores"] if s["cores"] > 0 else float("inf")
+    for s in servers:
+        if not can_run(s, need_c, need_m, need_d):
+            continue
+
+        running = s["running"]
+        waiting = s["waiting"]
+        cores = s["cores"]
+
+        # emphasise waiting jobs; running jobs still count but less
+        load = waiting * 2.0 + running * 0.5
+        per_core_load = load / cores
+
+        state_rank = STATE_RANK.get(s["state"], 3)
+
         key = (
-            load,
-            queue,
-            state_rank(s["state"]),
-            -s["cores"],
+            per_core_load,
+            waiting,
+            running,
+            state_rank,
+            -cores,
             s["id"],
         )
-        if best is None or key < best_key:
-            best = s
+
+        if best_key is None or key < best_key:
             best_key = key
+            best = s
+
+    if best is None:
+        # fallback: first capable server if something is weird
+        for s in servers:
+            if can_run(s, need_c, need_m, need_d):
+                return s
 
     return best
+
 
 
 
