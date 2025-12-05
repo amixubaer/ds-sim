@@ -1,5 +1,6 @@
 import socket
 import sys
+from xml.etree import ElementTree
 from typing import Dict, Any, List
 
 HOST = "localhost"
@@ -24,6 +25,45 @@ def recv_line(sock: socket.socket) -> str:
 
 def send_line(sock: socket.socket, msg: str) -> None:
     sock.sendall((msg + "\n").encode("utf-8"))
+
+
+def load_system(path: str = "ds-system.xml") -> Dict[str, Dict[str, Any]]:
+    info: Dict[str, Dict[str, Any]] = {}
+    try:
+        tree = ElementTree.parse(path)
+    except Exception as e:
+        log("failed to read ds-system.xml:", e)
+        return info
+
+    root = tree.getroot()
+    for node in root.iter("server"):
+        stype = node.attrib.get("type")
+        if not stype:
+            continue
+
+        def to_int(name: str, default: int = 0) -> int:
+            v = node.attrib.get(name)
+            try:
+                return int(v) if v is not None else default
+            except ValueError:
+                return default
+
+        def to_float(name: str, default: float = 0.0) -> float:
+            v = node.attrib.get(name)
+            try:
+                return float(v) if v is not None else default
+            except ValueError:
+                return default
+
+        info[stype] = {
+            "limit": to_int("limit", 1),
+            "boot_time": to_int("bootupTime", 0),
+            "hourly_rate": to_float("hourlyRate", 0.0),
+            "cores": to_int("coreCount", to_int("cores", 1)),
+            "memory": to_int("memory", 0),
+            "disk": to_int("disk", 0),
+        }
+    return info
 
 
 def parse_server(line: str) -> Dict[str, Any]:
@@ -99,6 +139,9 @@ def main() -> None:
     _ = recv_line(sock)
     send_line(sock, "AUTH Jubaer")
     _ = recv_line(sock)
+
+    sysinfo = load_system()
+    _ = sysinfo  # currently unused
 
     send_line(sock, "REDY")
     msg = recv_line(sock)
