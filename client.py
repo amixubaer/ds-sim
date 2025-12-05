@@ -102,10 +102,12 @@ def choose_server(servers, need_c, need_m, need_d, est_runtime):
 
     for s in eligible:
         queue = s["waiting"] + s["running"]
+        load = queue / s["cores"] if s["cores"] > 0 else float("inf")
         key = (
+            load,
             queue,
             state_rank(s["state"]),
-            s["cores"],
+            -s["cores"],
             s["id"],
         )
         if best is None or key < best_key:
@@ -113,6 +115,7 @@ def choose_server(servers, need_c, need_m, need_d, est_runtime):
             best_key = key
 
     return best
+
 
 
 def main():
