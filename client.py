@@ -92,49 +92,65 @@ def can_run(server, need_c, need_m, need_d):
         and server["disk"] >= need_d
     )
 
+def server_load(server):
+    base = server["waiting"] * 2.0 + server["running"] * 0.8
+    return base / server["cores"]
+
 def choose_server(servers, need_c, need_m, need_d, est_runtime):
+    candidates = []
+    for s in servers:
+        if can_run(s, need_c, need_m, need_d):
+            candidates.append(s)
+    if not candidates:
+        return None
+
+    active_loads = [
+        server_load(s) for s in candidates if s["state"] == "active"
+    ]
+    min_active_load = min(active_loads) if active_loads else None
+
     best = None
     best_key = None
 
-    for s in servers:
-        if not can_run(s, need_c, need_m, need_d):
-            continue
+    for s in candidates:
+        load = server_load(s)
+        state = s["state"]
 
-        running = s["running"]
-        waiting = s["waiting"]
-        cores = s["cores"]
-
-        base_load = waiting * 1.8 + running * 0.6
-        per_core_load = base_load / cores
-
-        if s["state"] == "active":
+        if state == "active":
             state_penalty = 0.0
-        elif s["state"] == "booting":
-            state_penalty = 0.4
-        elif s["state"] == "idle":
-            state_penalty = 0.7
-        else:
-            state_penalty = 1.5
+        elif state in ("booting", "idle"):
+            if state == "booting":
+                base = 0.3
+            else:
+                base = 0.5
 
-        load_score = per_core_load + state_penalty
+            if min_active_load is None or min_active_load > 1.8:
+                factor = 0.3
+            elif min_active_load > 1.2:
+                factor = 0.5
+            elif min_active_load > 0.8:
+                factor = 0.8
+            else:
+                factor = 1.2
+
+            state_penalty = base * factor
+        else:
+            state_penalty = 2.0
+
+        load_score = load + state_penalty
 
         key = (
             load_score,
-            waiting,
-            running,
-            STATE_RANK.get(s["state"], 3),
-            -cores,
+            s["waiting"],
+            s["running"],
+            STATE_RANK.get(state, 3),
+            -s["cores"],
             s["id"],
         )
 
         if best_key is None or key < best_key:
             best_key = key
             best = s
-
-    if best is None:
-        for s in servers:
-            if can_run(s, need_c, need_m, need_d):
-                return s
 
     return best
 
