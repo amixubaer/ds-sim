@@ -8,7 +8,6 @@ DEFAULT_PORT = 57922
 DEBUG = False
 
 
-
 def log(*args: Any) -> None:
     if DEBUG:
         print(*args, file=sys.stderr)
@@ -82,9 +81,7 @@ def parse_server(line: str) -> Dict[str, Any]:
     }
 
 
-def get_capable(
-    sock: socket.socket, cores: int, mem: int, disk: int
-) -> List[Dict[str, Any]]:
+def get_capable(sock: socket.socket, cores: int, mem: int, disk: int) -> List[Dict[str, Any]]:
     send_line(sock, f"GETS Capable {cores} {mem} {disk}")
     header = recv_line(sock)
     if not header.startswith("DATA"):
@@ -209,7 +206,7 @@ def main() -> None:
 
     send_line(sock, "HELO")
     _ = recv_line(sock)
-    send_line(sock, f"AUTH")
+    send_line(sock, "AUTH student")
     _ = recv_line(sock)
 
     sysinfo = load_system()
