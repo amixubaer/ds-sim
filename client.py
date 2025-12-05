@@ -209,7 +209,7 @@ def main() -> None:
 
     send_line(sock, "HELO")
     _ = recv_line(sock)
-    send_line(sock, f"AUTH {STUDENT_ID}")
+    send_line(sock, f"AUTH")
     _ = recv_line(sock)
 
     sysinfo = load_system()
