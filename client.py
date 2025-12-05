@@ -104,17 +104,25 @@ def choose_server(servers, need_c, need_m, need_d, est_runtime):
         waiting = s["waiting"]
         cores = s["cores"]
 
-        # emphasise waiting jobs; running jobs still count but less
-        load = waiting * 2.0 + running * 0.5
-        per_core_load = load / cores
+        base_load = waiting * 1.8 + running * 0.6
+        per_core_load = base_load / cores
 
-        state_rank = STATE_RANK.get(s["state"], 3)
+        if s["state"] == "active":
+            state_penalty = 0.0
+        elif s["state"] == "booting":
+            state_penalty = 0.4
+        elif s["state"] == "idle":
+            state_penalty = 0.7
+        else:
+            state_penalty = 1.5
+
+        load_score = per_core_load + state_penalty
 
         key = (
-            per_core_load,
+            load_score,
             waiting,
             running,
-            state_rank,
+            STATE_RANK.get(s["state"], 3),
             -cores,
             s["id"],
         )
@@ -124,7 +132,6 @@ def choose_server(servers, need_c, need_m, need_d, est_runtime):
             best = s
 
     if best is None:
-        # fallback: first capable server if something is weird
         for s in servers:
             if can_run(s, need_c, need_m, need_d):
                 return s
