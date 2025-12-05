@@ -85,6 +85,16 @@ STATE_RANK = {
     "inactive": 3,
 }
 
+WAIT_WEIGHT = 2.0
+RUN_WEIGHT = 0.8
+
+BASE_PENALTY_BOOTING = 0.3
+BASE_PENALTY_IDLE = 0.5
+
+THRESH1 = 0.8
+THRESH2 = 1.2
+THRESH3 = 1.8
+
 def can_run(server, need_c, need_m, need_d):
     return (
         server["cores"] >= need_c
@@ -93,7 +103,7 @@ def can_run(server, need_c, need_m, need_d):
     )
 
 def server_load(server):
-    base = server["waiting"] * 2.0 + server["running"] * 0.8
+    base = server["waiting"] * WAIT_WEIGHT + server["running"] * RUN_WEIGHT
     return base / server["cores"]
 
 def choose_server(servers, need_c, need_m, need_d, est_runtime):
@@ -120,15 +130,15 @@ def choose_server(servers, need_c, need_m, need_d, est_runtime):
             state_penalty = 0.0
         elif state in ("booting", "idle"):
             if state == "booting":
-                base = 0.3
+                base = BASE_PENALTY_BOOTING
             else:
-                base = 0.5
+                base = BASE_PENALTY_IDLE
 
-            if min_active_load is None or min_active_load > 1.8:
+            if min_active_load is None or min_active_load > THRESH3:
                 factor = 0.3
-            elif min_active_load > 1.2:
+            elif min_active_load > THRESH2:
                 factor = 0.5
-            elif min_active_load > 0.8:
+            elif min_active_load > THRESH1:
                 factor = 0.8
             else:
                 factor = 1.2
