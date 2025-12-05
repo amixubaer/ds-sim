@@ -1,193 +1,182 @@
 import socket
 import sys
-from typing import Dict, Any, List, Tuple
 from xml.etree import ElementTree
+from typing import Dict, Any, List, Tuple
 
 HOST = "localhost"
 DEFAULT_PORT = 50000
-BUF_SIZE = 8192
 DEBUG = False
 
 
-def log(*args, **kwargs):
+def log(*args: Any) -> None:
     if DEBUG:
-        print(*args, **kwargs, file=sys.stderr)
+        print(*args, file=sys.stderr)
 
 
-def send_msg(sock: socket.socket, msg: str) -> None:
-    if DEBUG:
-        print(">>", msg, file=sys.stderr)
-    sock.sendall((msg + "\n").encode("utf-8"))
-
-
-def recv_msg(sock: socket.socket) -> str:
+def recv_line(sock: socket.socket) -> str:
     data = b""
-    while True:
-        try:
-            chunk = sock.recv(BUF_SIZE)
-        except (TimeoutError, socket.timeout):
-            break
+    while not data.endswith(b"\n"):
+        chunk = sock.recv(1)
         if not chunk:
             break
         data += chunk
-        if len(chunk) < BUF_SIZE:
-            break
-    text = data.decode().strip()
-    if DEBUG:
-        print("<<", text, file=sys.stderr)
-    return text
+    return data.decode().strip()
 
 
-def load_system_file(path: str = "ds-system.xml") -> Dict[str, Dict[str, Any]]:
+def send_line(sock: socket.socket, msg: str) -> None:
+    sock.sendall((msg + "\n").encode("utf-8"))
+
+
+def load_system(path: str = "ds-system.xml") -> Dict[str, Dict[str, Any]]:
     info: Dict[str, Dict[str, Any]] = {}
     try:
         tree = ElementTree.parse(path)
     except Exception as e:
-        log("system file parse error:", e)
+        log("failed to read ds-system.xml:", e)
         return info
 
     root = tree.getroot()
-    for s in root.iter("server"):
-        s_type = s.attrib.get("type")
-        if not s_type:
+    for node in root.iter("server"):
+        stype = node.attrib.get("type")
+        if not stype:
             continue
 
-        def as_int(name: str, default: int = 0) -> int:
-            v = s.attrib.get(name)
-            if v is None:
-                return default
+        def to_int(name: str, default: int = 0) -> int:
+            v = node.attrib.get(name)
             try:
-                return int(v)
+                return int(v) if v is not None else default
             except ValueError:
                 return default
 
-        def as_float(name: str, default: float = 0.0) -> float:
-            v = s.attrib.get(name)
-            if v is None:
-                return default
+        def to_float(name: str, default: float = 0.0) -> float:
+            v = node.attrib.get(name)
             try:
-                return float(v)
+                return float(v) if v is not None else default
             except ValueError:
                 return default
 
-        info[s_type] = {
-            "limit": as_int("limit", 1),
-            "boot": as_int("bootupTime", 0),
-            "rate": as_float("hourlyRate", 0.0),
-            "cores": as_int("coreCount", as_int("cores", 1)),
-            "mem": as_int("memory", 0),
-            "disk": as_int("disk", 0),
+        info[stype] = {
+            "limit": to_int("limit", 1),
+            "boot_time": to_int("bootupTime", 0),
+            "hourly_rate": to_float("hourlyRate", 0.0),
+            "cores": to_int("coreCount", to_int("cores", 1)),
+            "memory": to_int("memory", 0),
+            "disk": to_int("disk", 0),
         }
     return info
 
 
 def parse_server(line: str) -> Dict[str, Any]:
-    p = line.split()
+    parts = line.split()
     return {
-        "type": p[0],
-        "id": int(p[1]),
-        "state": p[2],
-        "start": int(p[3]),
-        "cores": int(p[4]),
-        "mem": int(p[5]),
-        "disk": int(p[6]),
-        "w": int(p[7]),
-        "r": int(p[8]),
+        "type": parts[0],
+        "id": int(parts[1]),
+        "state": parts[2],
+        "curStartTime": int(parts[3]),
+        "cores": int(parts[4]),
+        "memory": int(parts[5]),
+        "disk": int(parts[6]),
+        "wJobs": int(parts[7]),
+        "rJobs": int(parts[8]),
     }
 
 
 def get_capable(
     sock: socket.socket, cores: int, mem: int, disk: int
 ) -> List[Dict[str, Any]]:
-    send_msg(sock, f"GETS Capable {cores} {mem} {disk}")
-    header = recv_msg(sock)
+    send_line(sock, f"GETS Capable {cores} {mem} {disk}")
+    header = recv_line(sock)
     if not header.startswith("DATA"):
-        log("bad DATA header:", header)
+        log("unexpected header:", header)
         return []
+
     _, count_str, _ = header.split()
     count = int(count_str)
 
-    send_msg(sock, "OK")
-    data = recv_msg(sock)
-    lines = data.splitlines()
+    send_line(sock, "OK")
 
     servers: List[Dict[str, Any]] = []
-    for line in lines[:count]:
-        line = line.strip()
+    for _ in range(count):
+        line = recv_line(sock)
         if line:
             servers.append(parse_server(line))
 
-    send_msg(sock, "OK")
-    _ = recv_msg(sock)  # final "."
+    send_line(sock, "OK")
+    _ = recv_line(sock)  # final "."
+
     return servers
 
 
-def ejwt(sock: socket.socket, s_type: str, s_id: int) -> int:
-    send_msg(sock, f"EJWT {s_type} {s_id}")
-    reply = recv_msg(sock)
+def ask_ewjt(sock: socket.socket, stype: str, sid: int) -> int:
+    send_line(sock, f"EJWT {stype} {sid}")
+    reply = recv_line(sock)
     try:
         return int(reply.strip())
     except ValueError:
-        log("ejwt parse error:", reply)
+        log("bad EJWT reply:", reply)
         return 0
 
 
-def pick_server(
+def choose_server(
     sock: socket.socket,
     job: Dict[str, int],
     servers: List[Dict[str, Any]],
     sysinfo: Dict[str, Dict[str, Any]],
 ) -> Tuple[str, int]:
-    need_c = job["cores"]
-    need_m = job["mem"]
-    need_d = job["disk"]
+    need_cores = job["cores"]
+    need_mem = job["memory"]
+    need_disk = job["disk"]
 
-    immediate: List[Tuple[int, int, str, int]] = []
-    delayed: List[Tuple[str, int, Dict[str, Any]]] = []
+    immediate: List[Tuple[int, float, int, int, str]] = []
+    queued: List[Tuple[str, int, str, int, float, int]] = []
 
     for s in servers:
-        if (
-            s["cores"] >= need_c
-            and s["mem"] >= need_m
-            and s["disk"] >= need_d
-        ):
-            si = sysinfo.get(s["type"], {})
-            base_cores = si.get("cores", s["cores"])
+        stype = s["type"]
+        sid = s["id"]
+        state = s["state"]
+        free_cores = s["cores"]
+        free_mem = s["memory"]
+        free_disk = s["disk"]
 
-            if s["state"] in ("idle", "active") and s["w"] == 0:
-                leftover = s["cores"] - need_c
-                immediate.append((leftover, base_cores, s["type"], s["id"]))
-            else:
-                delayed.append((s["type"], s["id"], s))
+        ok_resources = (
+            free_cores >= need_cores
+            and free_mem >= need_mem
+            and free_disk >= need_disk
+        )
+
+        meta = sysinfo.get(stype, {})
+        total_cores = meta.get("cores", free_cores)
+        rate = meta.get("hourly_rate", 0.0)
+        boot = meta.get("boot_time", 0)
+
+        if state in ("idle", "active") and ok_resources and s["wJobs"] == 0:
+            leftover = free_cores - need_cores
+            immediate.append((leftover, rate, total_cores, sid, stype))
+        elif ok_resources:
+            queued.append((stype, sid, state, boot, rate, total_cores))
 
     if immediate:
-        immediate.sort(key=lambda x: (x[0], x[1]))
-        _, _, t, i = immediate[0]
-        return t, i
+        immediate.sort(key=lambda t: (t[0], t[1], t[2], t[3]))
+        _, _, _, sid, stype = immediate[0]
+        return stype, sid
 
-    best: Tuple[int, int, str, int] | None = None
-    for t, i, s in delayed:
-        si = sysinfo.get(t, {})
-        boot = si.get("boot", 0)
-        base_cores = si.get("cores", s["cores"])
+    best = None  # (score, rate, total_cores, sid, stype)
 
-        q_wait = ejwt(sock, t, i)
+    for stype, sid, state, boot, rate, total_cores in queued:
+        wait = ask_ewjt(sock, stype, sid)
+        penalty = wait
+        if state == "inactive":
+            penalty += boot
+        elif state == "booting":
+            penalty += boot // 2
 
-        penalty = 0
-        if s["state"] == "inactive":
-            penalty = boot
-        elif s["state"] == "booting":
-            penalty = boot // 2
-
-        score = q_wait + penalty
-
-        if best is None or score < best[0] or (
-            score == best[0] and base_cores < best[1]
-        ):
-            best = (score, base_cores, t, i)
+        tup = (penalty, rate, total_cores, sid, stype)
+        if best is None or tup < best:
+            best = tup
 
     if best is not None:
-        return best[2], best[3]
+        _, _, _, sid, stype = best
+        return stype, sid
 
     first = servers[0]
     return first["type"], first["id"]
@@ -199,47 +188,39 @@ def parse_job(line: str) -> Dict[str, int]:
         "id": int(parts[1]),
         "submit": int(parts[2]),
         "cores": int(parts[3]),
-        "mem": int(parts[4]),
+        "memory": int(parts[4]),
         "disk": int(parts[5]),
-        "runtime": int(parts[6]),
+        "est_runtime": int(parts[6]),
     }
 
 
-def get_port_from_args() -> int:
+def main() -> None:
     port = DEFAULT_PORT
     args = sys.argv[1:]
-    if not args:
-        return port
+    if args:
+        if args[0] in ("-p", "--port") and len(args) >= 2:
+            try:
+                port = int(args[1])
+            except ValueError:
+                pass
+        else:
+            try:
+                port = int(args[0])
+            except ValueError:
+                pass
 
-    if args[0] == "-p" and len(args) >= 2:
-        try:
-            return int(args[1])
-        except ValueError:
-            return port
-
-    try:
-        return int(args[0])
-    except ValueError:
-        return port
-
-
-def main():
-    port = get_port_from_args()
-
-    sock = socket.socket()
-    sock.settimeout(2)
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.connect((HOST, port))
 
-    send_msg(sock, "HELO")
-    _ = recv_msg(sock)
+    send_line(sock, "HELO")
+    _ = recv_line(sock)
+    send_line(sock, "AUTH student")
+    _ = recv_line(sock)
 
-    send_msg(sock, "AUTH student")
-    _ = recv_msg(sock)
+    sysinfo = load_system()
 
-    sysinfo = load_system_file()
-
-    send_msg(sock, "REDY")
-    msg = recv_msg(sock)
+    send_line(sock, "REDY")
+    msg = recv_line(sock)
 
     while True:
         if not msg:
@@ -247,27 +228,23 @@ def main():
 
         if msg.startswith("JOBN") or msg.startswith("JOBP"):
             job = parse_job(msg)
-            servers = get_capable(sock, job["cores"], job["mem"], job["disk"])
-            if not servers:
-                send_msg(sock, "REDY")
-                msg = recv_msg(sock)
-                continue
-
-            s_type, s_id = pick_server(sock, job, servers, sysinfo)
-            send_msg(sock, f"SCHD {job['id']} {s_type} {s_id}")
-            _ = recv_msg(sock)
+            servers = get_capable(sock, job["cores"], job["memory"], job["disk"])
+            if servers:
+                stype, sid = choose_server(sock, job, servers, sysinfo)
+                send_line(sock, f"SCHD {job['id']} {stype} {sid}")
+                _ = recv_line(sock)
 
         elif msg.startswith("JCPL"):
             pass
         elif msg.startswith("RESF") or msg.startswith("RESR") or msg.startswith("CHKQ"):
             pass
         elif msg.startswith("NONE"):
-            send_msg(sock, "QUIT")
-            _ = recv_msg(sock)
+            send_line(sock, "QUIT")
+            _ = recv_line(sock)
             break
 
-        send_msg(sock, "REDY")
-        msg = recv_msg(sock)
+        send_line(sock, "REDY")
+        msg = recv_line(sock)
 
     sock.close()
 
