@@ -84,48 +84,36 @@ def choose_server(servers, need_c, need_m, need_d, est_runtime):
     for s in servers:
         if s["cores"] >= need_c and s["memory"] >= need_m and s["disk"] >= need_d:
             eligible.append(s)
-
     if not eligible:
         return None
 
-    state_weight = {
-        "active": 1.0,
-        "idle": 1.1,
-        "booting": 2.5,
-        "inactive": 50.0,
-    }
+    def state_rank(st):
+        st = st.lower()
+        if st == "active": return 0
+        if st == "idle": return 1
+        if st == "booting": return 2
+        return 3
 
-    heavy_job = est_runtime > 2000 or need_c >= 8
-
+    est_runtime = max(est_runtime, 1)
     candidates = []
+
     for s in eligible:
         queue = s["waiting"] + s["running"]
-        eff_cores = max(1, s["cores"])
-        base_ect = (queue + 1) * max(est_runtime, 1) / eff_cores
-        penalty = state_weight.get(s["state"].lower(), 3.0)
-        ect = base_ect * penalty
-
-        if heavy_job:
-            # long jobs → favour smaller ECT, then more cores
-            score = (
-                ect,             # lower ECT
-                -s["cores"],     # more cores
-                -s["memory"],    # more memory
-                s["id"],
-            )
-        else:
-            # short jobs → favour smaller ECT, but bias to smaller cores to control cost
-            score = (
-                ect,             # lower ECT
-                s["cores"],      # fewer cores (cheaper) when ECT similar
-                s["memory"],
-                s["id"],
-            )
-
+        eff = max(1, s["cores"])
+        ect = (queue + 1) * est_runtime / eff
+        score = (
+            state_rank(s["state"]),
+            queue,
+            ect,
+            -s["cores"],
+            -s["memory"],
+            s["id"]
+        )
         candidates.append((score, s))
 
     candidates.sort(key=lambda x: x[0])
     return candidates[0][1]
+
 
 
 def main():
