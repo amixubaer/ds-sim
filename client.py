@@ -88,28 +88,38 @@ def choose_server(servers, need_c, need_m, need_d, est_runtime):
     if not eligible:
         return None
 
+    state_weight = {
+        "active": 1.0,
+        "idle": 1.1,
+        "booting": 2.5,
+        "inactive": 50.0,
+    }
+
     heavy_job = est_runtime > 2000 or need_c >= 8
 
     candidates = []
     for s in eligible:
         queue = s["waiting"] + s["running"]
-        slack = s["cores"] - need_c
+        eff_cores = max(1, s["cores"])
+        base_ect = (queue + 1) * max(est_runtime, 1) / eff_cores
+        penalty = state_weight.get(s["state"].lower(), 3.0)
+        ect = base_ect * penalty
 
         if heavy_job:
-            # Long/heavy jobs → favour more cores, but still avoid long queues
+            # long jobs → favour smaller ECT, then more cores
             score = (
-                queue,           # primary: smallest queue
-                -s["cores"],     # then: more cores
-                slack,           # then: tighter fit
-                s["id"],         # stable tie-break
+                ect,             # lower ECT
+                -s["cores"],     # more cores
+                -s["memory"],    # more memory
+                s["id"],
             )
         else:
-            # Short/light jobs → best-fit on cores with queue awareness
+            # short jobs → favour smaller ECT, but bias to smaller cores to control cost
             score = (
-                queue,           # primary: smallest queue
-                slack,           # then: smallest slack (best fit)
-                s["type"],       # then: type name (stable)
-                s["id"],         # then: id
+                ect,             # lower ECT
+                s["cores"],      # fewer cores (cheaper) when ECT similar
+                s["memory"],
+                s["id"],
             )
 
         candidates.append((score, s))
