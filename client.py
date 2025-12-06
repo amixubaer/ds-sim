@@ -136,7 +136,12 @@ def choose_server(
         free_mem = s["memory"]
         free_disk = s["disk"]
 
-        if free_cores < need_cores or free_mem < need_mem or free_disk < need_disk:
+        ok_resources = (
+            free_cores >= need_cores
+            and free_mem >= need_mem
+            and free_disk >= need_disk
+        )
+        if not ok_resources:
             continue
 
         meta = sysinfo.get(stype, {})
