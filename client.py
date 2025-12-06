@@ -105,36 +105,62 @@ def get_capable(sock: socket.socket, cores: int, mem: int, disk: int) -> List[Di
     return servers
 
 
-def choose_best_fit(job: Dict[str, int], servers: List[Dict[str, Any]], sysinfo: Dict[str, Dict[str, Any]]) -> Tuple[str, int]:
+def ask_ewjt(sock: socket.socket, stype: str, sid: int) -> int:
+    send_line(sock, f"EJWT {stype} {sid}")
+    reply = recv_line(sock)
+    try:
+        return int(reply.strip())
+    except ValueError:
+        log("bad EJWT reply:", reply)
+        return 0
+
+
+def choose_server(
+    sock: socket.socket,
+    job: Dict[str, int],
+    servers: List[Dict[str, Any]],
+    sysinfo: Dict[str, Dict[str, Any]],
+) -> Tuple[str, int]:
     need_cores = job["cores"]
-    candidates: List[Tuple[int, int, str, int]] = []
+    need_mem = job["memory"]
+    need_disk = job["disk"]
+
+    immediate: List[Tuple[int, int, str, int]] = []
+    queued: List[Tuple[int, int, str, int]] = []
 
     for s in servers:
         stype = s["type"]
         sid = s["id"]
         state = s["state"]
-        if state not in ("idle", "active"):
-            continue
-
         free_cores = s["cores"]
         free_mem = s["memory"]
         free_disk = s["disk"]
 
-        if free_cores < need_cores or free_mem < job["memory"] or free_disk < job["disk"]:
+        if free_cores < need_cores or free_mem < need_mem or free_disk < need_disk:
             continue
 
         meta = sysinfo.get(stype, {})
         total_cores = meta.get("cores", free_cores)
-        leftover = free_cores - need_cores
-        candidates.append((leftover, total_cores, stype, sid))
 
-    if not candidates:
-        s = servers[0]
-        return s["type"], s["id"]
+        if state in ("idle", "active") and s["wJobs"] == 0:
+            leftover = free_cores - need_cores
+            immediate.append((leftover, total_cores, stype, sid))
+        else:
+            wait = ask_ewjt(sock, stype, sid)
+            queued.append((wait, total_cores, stype, sid))
 
-    candidates.sort(key=lambda t: (t[0], t[1]))
-    _, _, stype, sid = candidates[0]
-    return stype, sid
+    if immediate:
+        immediate.sort(key=lambda t: (t[0], t[1]))
+        _, _, stype, sid = immediate[0]
+        return stype, sid
+
+    if queued:
+        queued.sort(key=lambda t: (t[0], t[1]))
+        _, _, stype, sid = queued[0]
+        return stype, sid
+
+    first = servers[0]
+    return first["type"], first["id"]
 
 
 def parse_job(line: str) -> Dict[str, int]:
@@ -185,7 +211,7 @@ def main() -> None:
             job = parse_job(msg)
             servers = get_capable(sock, job["cores"], job["memory"], job["disk"])
             if servers:
-                stype, sid = choose_best_fit(job, servers, sysinfo)
+                stype, sid = choose_server(sock, job, servers, sysinfo)
                 send_line(sock, f"SCHD {job['id']} {stype} {sid}")
                 _ = recv_line(sock)
         elif msg.startswith("JCPL"):
