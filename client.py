@@ -141,21 +141,27 @@ def choose_server(
 
         meta = sysinfo.get(stype, {})
         total_cores = meta.get("cores", free_cores)
+        boot_time = meta.get("boot_time", 0)
 
         if state in ("idle", "active") and s["wJobs"] == 0:
             leftover = free_cores - need_cores
             immediate.append((leftover, total_cores, stype, sid))
         else:
             wait = ask_ewjt(sock, stype, sid)
-            queued.append((wait, total_cores, stype, sid))
+            penalty = wait
+            if state == "inactive":
+                penalty += boot_time
+            elif state == "booting":
+                penalty += boot_time // 2
+            queued.append((penalty, total_cores, stype, sid))
 
     if immediate:
-        immediate.sort(key=lambda t: (t[0], t[1]))
+        immediate.sort(key=lambda t: (t[0], t[1], t[2], t[3]))
         _, _, stype, sid = immediate[0]
         return stype, sid
 
     if queued:
-        queued.sort(key=lambda t: (t[0], t[1]))
+        queued.sort(key=lambda t: (t[0], t[1], t[2], t[3]))
         _, _, stype, sid = queued[0]
         return stype, sid
 
